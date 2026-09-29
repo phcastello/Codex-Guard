@@ -1,0 +1,244 @@
+use anyhow::{anyhow, bail, Context, Result};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{ChildStdin, ChildStdout},
+    sync::{mpsc, oneshot, Mutex},
+};
+
+#[derive(Debug)]
+pub struct Event {
+    pub method: String,
+    pub params: Value,
+}
+
+#[derive(Clone)]
+pub struct Client {
+    writer: Arc<Mutex<ChildStdin>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Client {
+    pub fn new(stdin: ChildStdin, stdout: ChildStdout) -> (Self, mpsc::Receiver<Event>) {
+        let client = Self {
+            writer: Arc::new(Mutex::new(stdin)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+        let (tx, rx) = mpsc::channel(256);
+        let pending = client.pending.clone();
+        let reply = client.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                let line = match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Event {
+                                method: "guard/transportError".into(),
+                                params: json!({"message": error.to_string()}),
+                            })
+                            .await;
+                        break;
+                    }
+                };
+                let message: Value = match serde_json::from_str(&line) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                if let Some(id) = message.get("id") {
+                    if message.get("method").is_some() {
+                        // MVP deliberately declines unexpected server requests. With approvalPolicy=never
+                        // normal command/file approvals are not expected.
+                        let _ = reply.send_value(json!({"id": id, "error": {"code": -32601, "message": "Unsupported by Codex Guard"}})).await;
+                    } else if let Some(number) = id.as_u64() {
+                        if let Some(sender) = pending.lock().await.remove(&number) {
+                            let result = if let Some(error) = message.get("error") {
+                                Err(anyhow!("App Server error: {error}"))
+                            } else {
+                                Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            let _ = sender.send(result);
+                        }
+                    }
+                } else if let Some(method) = message.get("method").and_then(Value::as_str) {
+                    if tx
+                        .send(Event {
+                            method: method.into(),
+                            params: message.get("params").cloned().unwrap_or(Value::Null),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            let mut map = pending.lock().await;
+            for (_, sender) in map.drain() {
+                let _ = sender.send(Err(anyhow!("App Server stdout closed")));
+            }
+            let _ = tx
+                .send(Event {
+                    method: "guard/disconnected".into(),
+                    params: Value::Null,
+                })
+                .await;
+        });
+        (client, rx)
+    }
+
+    async fn send_value(&self, value: Value) -> Result<()> {
+        let mut writer = self.writer.lock().await;
+        writer
+            .write_all(serde_json::to_string(&value)?.as_bytes())
+            .await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    }
+    pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        let mut request = json!({"id": id, "method": method});
+        if let Some(p) = params {
+            request["params"] = p;
+        }
+        if let Err(error) = self.send_value(request).await {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(result) => result.context("App Server response dropped")?,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                bail!("App Server request timed out: {method}");
+            }
+        }
+    }
+    pub async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.send_value(json!({"method": method, "params": params}))
+            .await
+    }
+    pub async fn close_stdin(&self) -> Result<()> {
+        self.writer
+            .lock()
+            .await
+            .shutdown()
+            .await
+            .context("close App Server stdin")
+    }
+    pub async fn initialize(&self) -> Result<()> {
+        self.call("initialize", Some(json!({"clientInfo":{"name":"codex_guard","title":"Codex Guard","version":env!("CARGO_PKG_VERSION")}}))).await?;
+        self.notify("initialized", json!({})).await
+    }
+    pub async fn rate_limits(&self) -> Result<RateSnapshot> {
+        let result = self.call("account/rateLimits/read", None).await?;
+        RateSnapshot::parse(&result)
+    }
+    pub async fn steer(&self, thread: &str, turn: &str, text: &str) -> Result<()> {
+        self.call("turn/steer", Some(json!({"threadId":thread,"expectedTurnId":turn,"input":[{"type":"text","text":text}]}))).await?;
+        Ok(())
+    }
+    pub async fn interrupt(&self, thread: &str, turn: &str) -> Result<()> {
+        self.call(
+            "turn/interrupt",
+            Some(json!({"threadId":thread,"turnId":turn})),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Window {
+    pub used: f64,
+    pub resets_at: Option<i64>,
+    pub duration_mins: u64,
+}
+#[derive(Clone, Debug)]
+pub struct RateSnapshot {
+    pub primary: Option<Window>,
+    pub secondary: Option<Window>,
+    pub balance: Option<f64>,
+    pub unlimited: bool,
+    pub ordinary_usage_allowed: Option<bool>,
+    pub account_id: Option<String>,
+}
+impl RateSnapshot {
+    pub fn parse(root: &Value) -> Result<Self> {
+        let rate = root.get("rateLimits").context("rateLimits missing")?;
+        let credits = rate
+            .get("credits")
+            .filter(|x| !x.is_null())
+            .or_else(|| root.pointer("/rateLimitsByLimitId/codex/credits"));
+        let balance = credits
+            .and_then(|x| x.get("balance"))
+            .and_then(Value::as_str)
+            .and_then(|x| x.parse::<f64>().ok());
+        let unlimited = credits
+            .and_then(|x| x.get("unlimited"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if balance.is_some_and(|x| !x.is_finite() || x < 0.0) {
+            bail!("invalid credit balance");
+        }
+        let windows = [window(rate.get("primary")), window(rate.get("secondary"))];
+        let primary = windows
+            .iter()
+            .flatten()
+            .find(|w| w.duration_mins == 300)
+            .cloned();
+        let secondary = windows
+            .iter()
+            .flatten()
+            .find(|w| w.duration_mins == 10080)
+            .cloned();
+        Ok(Self {
+            primary,
+            secondary,
+            balance,
+            unlimited,
+            ordinary_usage_allowed: root.get("ordinaryUsageAllowed").and_then(Value::as_bool),
+            account_id: root
+                .get("accountId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+}
+fn window(value: Option<&Value>) -> Option<Window> {
+    let value = value?;
+    Some(Window {
+        used: value.get("usedPercent")?.as_f64()?,
+        resets_at: value.get("resetsAt").and_then(Value::as_i64),
+        duration_mins: value.get("windowDurationMins")?.as_u64()?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn selects_five_hour_window_and_parses_credit_balance() {
+        let snapshot = RateSnapshot::parse(&json!({
+            "rateLimits": {"primary":{"usedPercent":10.0,"windowDurationMins":300,"resetsAt":100},"secondary":{"usedPercent":30.0,"windowDurationMins":10080,"resetsAt":200},"credits":{"balance":"186.00","hasCredits":true,"unlimited":false}},
+            "ordinaryUsageAllowed":true,"accountId":"acct"
+        })).unwrap();
+        assert_eq!(snapshot.primary.unwrap().used, 10.0);
+        assert_eq!(snapshot.secondary.unwrap().used, 30.0);
+        assert_eq!(snapshot.balance, Some(186.0));
+    }
+}
