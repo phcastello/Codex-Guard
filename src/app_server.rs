@@ -275,6 +275,7 @@ pub struct RateSnapshot {
     pub primary: Option<Window>,
     pub secondary: Option<Window>,
     pub balance: Option<f64>,
+    pub has_credits: Option<bool>,
     pub unlimited: bool,
     pub ordinary_usage_allowed: Option<bool>,
     pub account_id: Option<String>,
@@ -294,6 +295,9 @@ impl RateSnapshot {
             .and_then(|x| x.get("unlimited"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let has_credits = credits
+            .and_then(|x| x.get("hasCredits"))
+            .and_then(Value::as_bool);
         if balance.is_some_and(|x| !x.is_finite() || x < 0.0) {
             bail!("invalid credit balance");
         }
@@ -312,6 +316,7 @@ impl RateSnapshot {
             primary,
             secondary,
             balance,
+            has_credits,
             unlimited,
             ordinary_usage_allowed: root.get("ordinaryUsageAllowed").and_then(Value::as_bool),
             account_id: root
@@ -399,5 +404,15 @@ mod tests {
         assert_eq!(snapshot.primary.unwrap().used, 10.0);
         assert_eq!(snapshot.secondary.unwrap().used, 30.0);
         assert_eq!(snapshot.balance, Some(186.0));
+        assert_eq!(snapshot.has_credits, Some(true));
+    }
+    #[test]
+    fn preserves_credit_availability_with_null_balance() {
+        let snapshot = RateSnapshot::parse(&json!({
+            "rateLimits":{"credits":{"balance":null,"hasCredits":false,"unlimited":false}}
+        }))
+        .unwrap();
+        assert_eq!(snapshot.balance, None);
+        assert_eq!(snapshot.has_credits, Some(false));
     }
 }

@@ -16,11 +16,15 @@ use futures_util::StreamExt;
 use logging::Logger;
 use policy::{Action, Phase, Policy};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 use supervisor::ProcessSupervisor;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::mpsc,
+    task::JoinHandle,
     time::{interval, MissedTickBehavior},
 };
 use tui::Tui;
@@ -69,8 +73,50 @@ async fn main() -> Result<()> {
 
 struct Stop {
     reason: String,
-    at: Instant,
+    at: tokio::time::Instant,
     stage: u8,
+    interrupt: Option<JoinHandle<Result<()>>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StopStep {
+    Graceful,
+    Force,
+}
+
+impl Stop {
+    fn new(
+        reason: String,
+        at: tokio::time::Instant,
+        interrupt: impl Future<Output = Result<()>> + Send + 'static,
+    ) -> Self {
+        // The deadline starts at detection, before the interrupt RPC can wait for
+        // TurnAborted. The RPC remains a request with its own id, not a notification.
+        let interrupt = tokio::spawn(interrupt);
+        Self {
+            reason,
+            at,
+            stage: 0,
+            interrupt: Some(interrupt),
+        }
+    }
+
+    fn next_step(
+        &mut self,
+        interrupt_grace: Duration,
+        terminate_grace: Duration,
+    ) -> Option<StopStep> {
+        if self.stage == 0 && self.at.elapsed() >= interrupt_grace {
+            self.stage = 1;
+            self.at = tokio::time::Instant::now();
+            Some(StopStep::Graceful)
+        } else if self.stage == 1 && self.at.elapsed() >= terminate_grace {
+            self.stage = 2;
+            Some(StopStep::Force)
+        } else {
+            None
+        }
+    }
 }
 
 async fn run(loaded: Loaded, prompt: String) -> Result<()> {
@@ -194,19 +240,34 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
         tokio::select! {
             _ = redraw.tick() => {
                 if stop.is_none() && started.elapsed() >= config::duration(&policy.profile.runtime.max) {
-                    begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, "runtime limit reached".into()).await;
+                    begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, "runtime limit reached".into());
                 }
                 if let Some(s) = stop.as_mut() {
-                    if s.stage == 0 && s.at.elapsed() >= config::duration(&policy.profile.runtime.interrupt_grace) {
-                        logger.record("process_termination", json!({"stage":"graceful","reason":s.reason}));
-                        if let Err(error) = process.graceful_terminate().await { logger.record("error", json!({"graceful_termination":error.to_string()})); }
-                        s.stage = 1; s.at = Instant::now();
-                    } else if s.stage == 1 && s.at.elapsed() >= config::duration(&policy.profile.runtime.terminate_grace) {
-                        logger.record("process_termination", json!({"stage":"force","reason":s.reason}));
-                        process.force_kill_tree().await?;
-                        policy.phase = Phase::Killed;
-                        result = Some(format!("killed: {}", s.reason));
-                        break;
+                    if s.interrupt.as_ref().is_some_and(JoinHandle::is_finished) {
+                        if let Some(handle) = s.interrupt.take() {
+                            match handle.await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(error)) => logger.record("error", json!({"interrupt":error.to_string()})),
+                                Err(error) => logger.record("error", json!({"interrupt_task":error.to_string()})),
+                            }
+                        }
+                    }
+                    match s.next_step(
+                        config::duration(&policy.profile.runtime.interrupt_grace),
+                        config::duration(&policy.profile.runtime.terminate_grace),
+                    ) {
+                        Some(StopStep::Graceful) => {
+                            logger.record("process_termination", json!({"stage":"graceful","reason":s.reason}));
+                            if let Err(error) = process.graceful_terminate().await { logger.record("error", json!({"graceful_termination":error.to_string()})); }
+                        }
+                        Some(StopStep::Force) => {
+                            logger.record("process_termination", json!({"stage":"force","reason":s.reason}));
+                            process.force_kill_tree().await?;
+                            policy.phase = Phase::Killed;
+                            result = Some(format!("killed: {}", s.reason));
+                            break;
+                        }
+                        None => {},
                     }
                 }
                 if process.try_wait()?.is_some() && result.is_none() {
@@ -219,7 +280,7 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
                 }
                 ui.draw(&policy, &loaded.profile_name, &loaded.mode, started, &logger, thread_usage.as_ref(), tools_done, tools_running)?;
             }
-            _ = &mut next_poll => {
+            _ = &mut next_poll, if stop.is_none() => {
                 let success = reconcile_rate_limits(&client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn, &mut consecutive_poll_failures).await;
                 let delay = if success { policy.poll_interval() } else { config::duration(&policy.profile.monitor.retry_interval) };
                 next_poll.as_mut().reset(tokio::time::Instant::now() + delay);
@@ -240,9 +301,11 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
                     }
                     "account/rateLimits/updated" => {
                         client.ack_rate_update();
-                        let success = reconcile_rate_limits(&client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn, &mut consecutive_poll_failures).await;
-                        let delay = if success { policy.poll_interval() } else { config::duration(&policy.profile.monitor.retry_interval) };
-                        next_poll.as_mut().reset(tokio::time::Instant::now() + delay);
+                        if stop.is_none() {
+                            let success = reconcile_rate_limits(&client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn, &mut consecutive_poll_failures).await;
+                            let delay = if success { policy.poll_interval() } else { config::duration(&policy.profile.monitor.retry_interval) };
+                            next_poll.as_mut().reset(tokio::time::Instant::now() + delay);
+                        }
                     }
                     "item/completed" => {
                         if let Some((message, is_final)) = agent_message(&event.params) {
@@ -255,7 +318,7 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
                     "guard/unsupportedRequest" => {
                         let method = event.params.get("method").and_then(Value::as_str).unwrap_or("unknown");
                         logger.record("error", json!({"unsupported_server_request":method}));
-                        begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, format!("unsupported App Server request: {method}")).await;
+                        begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, format!("unsupported App Server request: {method}"));
                     }
                     "guard/disconnected" | "guard/transportError" => { logger.record("error", json!({"transport":event.params})); policy.phase = Phase::Failed; result = Some("App Server disconnected".into()); break; }
                     "error" => logger.record("error", event.params),
@@ -366,6 +429,27 @@ mod tests {
         assert_eq!(agent_message(&params), Some((text.into(), true)));
         assert!(agent_message(&json!({"item":{"type":"commandExecution","text":text}})).is_none());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_interrupt_response_does_not_block_escalation() {
+        let mut stop = Stop::new(
+            "budget reached".into(),
+            tokio::time::Instant::now(),
+            async { std::future::pending::<Result<()>>().await },
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(8)).await;
+        assert!(!stop.interrupt.as_ref().unwrap().is_finished());
+        assert_eq!(
+            stop.next_step(Duration::from_secs(8), Duration::from_secs(4)),
+            Some(StopStep::Graceful)
+        );
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            stop.next_step(Duration::from_secs(8), Duration::from_secs(4)),
+            Some(StopStep::Force)
+        );
+    }
 }
 
 fn quota_json(snapshot: &app_server::RateSnapshot) -> Value {
@@ -429,8 +513,7 @@ async fn reconcile_rate_limits(
                     thread,
                     turn,
                     "rate-limit telemetry unavailable".into(),
-                )
-                .await;
+                );
             }
             false
         }
@@ -477,9 +560,7 @@ async fn apply_actions(
                 logger.record("quota_reset", json!({}));
                 ui.notice("5h quota window reset");
             }
-            Action::Stop(reason) => {
-                begin_stop(client, policy, logger, stop, thread, turn, reason).await
-            }
+            Action::Stop(reason) => begin_stop(client, policy, logger, stop, thread, turn, reason),
             Action::Bell if policy.profile.monitor.bell => {
                 let _ = crossterm::execute!(std::io::stdout(), crossterm::style::Print("\x07"));
             }
@@ -487,7 +568,7 @@ async fn apply_actions(
         }
     }
 }
-async fn begin_stop(
+fn begin_stop(
     client: &Client,
     policy: &mut Policy,
     logger: &mut Logger,
@@ -499,16 +580,15 @@ async fn begin_stop(
     if stop.is_some() {
         return;
     }
+    let detected_at = tokio::time::Instant::now();
     policy.phase = Phase::Interrupting;
     logger.record("turn_interrupt", json!({"reason":reason}));
-    *stop = Some(Stop {
-        reason,
-        at: Instant::now(),
-        stage: 0,
-    });
-    if let Err(error) = client.interrupt(thread, turn).await {
-        logger.record("error", json!({"interrupt":error.to_string()}));
-    }
+    let client = client.clone();
+    let thread = thread.to_owned();
+    let turn = turn.to_owned();
+    *stop = Some(Stop::new(reason, detected_at, async move {
+        client.interrupt(&thread, &turn).await
+    }));
 }
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
@@ -581,8 +661,7 @@ async fn handle_command(
                         thread,
                         turn,
                         "new task budget already reached".into(),
-                    )
-                    .await;
+                    );
                 }
             }
             Err(error) => ui.notice(format!("Invalid budget: {error}")),
@@ -596,8 +675,7 @@ async fn handle_command(
             thread,
             turn,
             "user requested interruption".into(),
-        )
-        .await;
+        );
         ui.notice("Interrupt requested");
     } else if command == "/kill-confirmed" {
         logger.record(

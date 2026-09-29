@@ -70,14 +70,7 @@ pub struct Policy {
 
 impl Policy {
     pub fn new(profile: Profile, first: RateSnapshot) -> Result<Self> {
-        if first.unlimited {
-            bail!("credit balance is unlimited; a paid-credit hard budget cannot be enforced");
-        }
-        let balance = first.balance.ok_or_else(|| {
-            anyhow::anyhow!(
-                "App Server did not provide a numeric credit balance; cannot enforce hard budget"
-            )
-        })?;
+        let balance = finite_balance(&first)?;
         if profile.quota.hard_stop {
             if first.primary.is_none() && first.ordinary_usage_allowed.is_none() {
                 bail!("quota hard stop cannot be enforced without quota telemetry");
@@ -181,14 +174,14 @@ impl Policy {
         if self.account_id.is_none() {
             self.account_id = snapshot.account_id.clone();
         }
-        if snapshot.unlimited || snapshot.balance.is_none() {
-            actions.push(Action::Stop(
-                "credit balance unavailable; hard budget cannot be enforced".into(),
-            ));
-            self.latest = snapshot;
-            return actions;
-        }
-        let balance = snapshot.balance.unwrap_or(self.last_balance);
+        let balance = match finite_balance(&snapshot) {
+            Ok(balance) => balance,
+            Err(error) => {
+                actions.push(Action::Stop(error.to_string()));
+                self.latest = snapshot;
+                return actions;
+            }
+        };
         let delta = (self.last_balance - balance).max(0.0);
         self.last_balance = balance;
         self.spent += delta;
@@ -294,6 +287,19 @@ impl Policy {
     }
 }
 
+fn finite_balance(snapshot: &RateSnapshot) -> Result<f64> {
+    if snapshot.unlimited {
+        bail!("credit balance is unlimited; a paid-credit hard budget cannot be enforced");
+    }
+    match (snapshot.balance, snapshot.has_credits) {
+        (Some(balance), _) => Ok(balance),
+        (None, Some(false)) => Ok(0.0),
+        (None, _) => {
+            bail!("App Server did not provide a numeric credit balance; cannot enforce hard budget")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +314,7 @@ mod tests {
             }),
             secondary: None,
             balance: Some(balance),
+            has_credits: Some(true),
             unlimited: false,
             ordinary_usage_allowed: allowed,
             account_id: Some("account-a".into()),
@@ -381,5 +388,41 @@ mod tests {
         assert_eq!(policy.poll_interval(), Duration::from_secs(10));
         policy.observe(sample(100.0, 1, 82.0, Some(false)));
         assert_eq!(policy.poll_interval(), Duration::from_secs(5));
+    }
+    #[test]
+    fn zero_credits_with_null_balance_is_a_finite_zero() {
+        let mut first = sample(20.0, 1, 0.0, Some(true));
+        first.balance = None;
+        first.has_credits = Some(false);
+        let policy = Policy::new(Profile::default(), first).unwrap();
+        assert_eq!(policy.balance(), 0.0);
+        assert_eq!(policy.spent, 0.0);
+    }
+    #[test]
+    fn available_credits_with_null_balance_fail_closed() {
+        let mut first = sample(20.0, 1, 0.0, Some(true));
+        first.balance = None;
+        first.has_credits = Some(true);
+        assert!(Policy::new(Profile::default(), first).is_err());
+    }
+    #[test]
+    fn top_up_from_zero_is_not_spend_but_later_debit_is() {
+        let mut profile = Profile::default();
+        profile.credits.reserve = 0.0;
+        let mut first = sample(20.0, 1, 0.0, Some(true));
+        first.balance = None;
+        first.has_credits = Some(false);
+        let mut policy = Policy::new(profile, first).unwrap();
+        let actions = policy.observe(sample(20.0, 1, 10.0, Some(true)));
+        assert_eq!(policy.balance(), 10.0);
+        assert_eq!(policy.spent, 0.0);
+        assert!(!policy.paid_now());
+        assert!(!actions.iter().any(|a| matches!(a, Action::Billing(_))));
+        let actions = policy.observe(sample(100.0, 1, 8.0, Some(false)));
+        assert_eq!(policy.spent, 2.0);
+        assert!(policy.paid_now());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Billing("PAID CREDITS"))));
     }
 }
