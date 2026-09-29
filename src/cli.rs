@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "codex-guard",
     version,
-    about = "Supervise a Codex App Server task"
+    about = "Interactive, quota-aware frontend for Codex App Server"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -40,6 +40,6 @@ pub struct RunArgs {
     pub attended: bool,
     #[arg(long)]
     pub no_bell: bool,
-    #[arg(num_args = 1.., trailing_var_arg = true)]
+    #[arg(num_args = 0.., trailing_var_arg = true, value_name = "PROMPT")]
     pub prompt: Vec<String>,
 }

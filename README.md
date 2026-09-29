@@ -1,6 +1,6 @@
 # Codex Guard
 
-Codex Guard is a small terminal frontend for a Codex App Server process that it starts and owns. It watches the included quota and the account credit balance, steers a running turn near thresholds, and interrupts when a task's paid-credit budget is reached.
+Codex Guard is a small interactive terminal frontend for a Codex App Server process that it starts and owns. It watches the included quota and the account credit balance, steers a running turn near thresholds, and interrupts when the session's paid-credit budget is reached.
 
 This is an MVP. It requires a recent `codex` executable on `PATH`, authenticated with ChatGPT, and a terminal supporting crossterm. It uses the documented stdio App Server protocol. The implementation was checked against `codex-cli 0.159.0` and its generated v2 JSON schema.
 
@@ -8,17 +8,19 @@ This is an MVP. It requires a recent `codex` executable on `PATH`, authenticated
 
 ```sh
 cargo build --release
-cargo run -- "Fix the backend issue"
+cargo run --
 ```
 
 On Windows PowerShell:
 
 ```powershell
 cargo build --release
-cargo run -- "Fix the backend issue"
+cargo run --
 ```
 
 The release executable is `codex-guard` (`codex-guard.exe` on Windows). You may define your own `cg` shell alias. No Codex task is started by build commands.
+
+`codex-guard [OPTIONS] [PROMPT...]` opens the TUI. With no prompt, it starts in READY: the App Server is initialized and account limits are shown, but no thread or turn is created until you type a prompt and press Enter. A CLI prompt is an optional shortcut that starts a turn in the same TUI. For example: `codex-guard`, `codex-guard -p conservative`, `codex-guard -c 5`, `codex-guard "Fix the backend issue"`, or `codex-guard -p conservative "Review this"`.
 
 ## Configuration
 
@@ -74,7 +76,8 @@ urgent_finalize_at = 0.85
 
 `codex-guard config show` prints the effective profile. `codex-guard profiles` lists configured profiles. `-p`, `-c`/`--credits`, `-t`/`--time`, and `--attended` override one execution. The default mode is unattended. Both session permission overrides are omitted by default, so the App Server inherits the user's Codex settings. `--attended` is still partial: it changes the displayed mode and does not provide interactive approval handling. Hard financial limits apply in either mode.
 
-Commands in the TUI: `/help`, `/status`, `/logs`, `/steer TEXT`, `/budget NUMBER`, `/profile`, `/interrupt`, `/kill`, `/quit`. Interrupt requires `y`; kill requires typing `kill`; quit with an active turn requires typing `quit` and interrupts the turn. Agent messages appear in their own pane; Page Up and Page Down scroll the full message. The final agent response is printed after the TUI closes.
+Commands in the TUI: `/help`, `/status`, `/logs`, `/steer TEXT`, `/budget NUMBER`, `/profile`, `/interrupt`, `/kill`, `/quit`. Interrupt requires `y`; kill requires typing `kill`; quit with an active turn requires typing `quit` and interrupts the turn. Agent messages appear in their own pane; Page Up and Page Down scroll the full message. The final answer stays in the TUI; exiting prints a session summary.
+Normal text in READY or COMPLETED starts a turn. A follow-up reuses the existing thread; normal text while a turn is active is rejected, so steering requires `/steer TEXT`. The final agent message remains in the TUI after completion, and another prompt can start a follow-up. `/interrupt` without an active turn reports that no turn exists; `/quit` without a turn closes normally. `/budget` without a value shows the session budget.
 
 ## Architecture and safety boundaries
 
@@ -85,7 +88,7 @@ Commands in the TUI: `/help`, `/status`, `/logs`, `/steer TEXT`, `/budget NUMBER
 - `src/tui.rs`: small ratatui interface and slash command bar.
 - `src/logging.rs`: one JSONL event log per run, including a final summary. `codex-guard` prints the path on exit.
 
-The Guard records the initial credit balance before starting a turn, sums **positive decreases** on later samples, and retains that sum across quota resets or balance top-ups. A reported `hasCredits=false`, `unlimited=false`, and null balance is treated as a finite zero; a top-up does not count as spend. If credits are available but the balance is unknown, or if the account changes, it interrupts the task. Unlimited balances remain unsupported because a balance-decrease budget cannot be enforced. A failed rate-limit read interrupts immediately while paid or near a threshold. With ample included quota, up to `max_consecutive_failures` failures are retried at `retry_interval`; then the turn is interrupted. The credit balance is account-level, so concurrent Codex use on the same account can be counted against this task. Credit charges between samples can exceed a threshold before the Guard observes them. This is a circuit breaker with finite observation latency, not a transactional spending cap.
+The Guard records the initial credit balance, sums **positive decreases** on later samples, and retains that sum across turns, quota resets, and balance top-ups. The hard paid-credit budget is for the entire Guard session, not each turn. READY uses normal polling and refreshes the baseline; a fresh `account/rateLimits/read` is required before every `turn/start`. Decreases on the same account while idle are conservatively counted, including late charges from a prior turn; top-ups and idle account switches do not erase cumulative spend. A reported `hasCredits=false`, `unlimited=false`, and null balance is treated as a finite zero. If credits are available but the balance is unknown, the next turn cannot start. Unlimited balances remain unsupported because a balance-decrease budget cannot be enforced. A failed rate-limit read interrupts immediately while paid or near a threshold. With ample included quota, up to `max_consecutive_failures` failures are retried at `retry_interval`; then the turn is interrupted. The credit balance is account-level, so concurrent Codex use on the same account can be counted against this session. Credit charges between samples can exceed a threshold before the Guard observes them. This is a circuit breaker with finite observation latency, not a transactional spending cap.
 
 `account/usage/read` with the thread id supplies **estimated** thread credits, USD cost, and model/token breakdown when available. The TUI and JSONL log show this complementary telemetry. It never replaces account-balance decreases for the hard paid-credit budget; failure to fetch it does not stop the task.
 

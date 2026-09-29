@@ -21,10 +21,6 @@ pub enum Phase {
     Paid,
     PaidFinalizing,
     PaidCritical,
-    Interrupting,
-    Completed,
-    Killed,
-    Failed,
 }
 impl Phase {
     pub fn label(self) -> &'static str {
@@ -34,10 +30,6 @@ impl Phase {
             Self::Paid => "PAID",
             Self::PaidFinalizing => "FINALIZING",
             Self::PaidCritical => "PAID CRITICAL",
-            Self::Interrupting => "INTERRUPTING",
-            Self::Completed => "COMPLETED",
-            Self::Killed => "KILLED",
-            Self::Failed => "FAILED",
         }
     }
 }
@@ -71,16 +63,6 @@ pub struct Policy {
 impl Policy {
     pub fn new(profile: Profile, first: RateSnapshot) -> Result<Self> {
         let balance = finite_balance(&first)?;
-        if profile.quota.hard_stop {
-            if first.primary.is_none() && first.ordinary_usage_allowed.is_none() {
-                bail!("quota hard stop cannot be enforced without quota telemetry");
-            }
-            if first.primary.as_ref().is_some_and(|w| w.used >= 100.0)
-                || first.ordinary_usage_allowed == Some(false)
-            {
-                bail!("included quota is already exhausted (quota hard stop enabled)");
-            }
-        }
         Ok(Self {
             profile,
             phase: Phase::Included,
@@ -103,6 +85,68 @@ impl Policy {
     }
     pub fn balance(&self) -> f64 {
         self.last_balance
+    }
+    pub fn observe_idle(&mut self, snapshot: RateSnapshot) -> Result<bool> {
+        let balance = finite_balance(&snapshot)?;
+        if self.account_id == snapshot.account_id {
+            // Late charges from a completed turn still consume this session's
+            // budget. Positive top-ups do not reduce accumulated spend.
+            self.spent += (self.last_balance - balance).max(0.0);
+        }
+        let reset = self.latest.primary.as_ref().and_then(|w| w.resets_at)
+            != snapshot.primary.as_ref().and_then(|w| w.resets_at)
+            && self
+                .latest
+                .primary
+                .as_ref()
+                .and_then(|w| w.resets_at)
+                .is_some();
+        if reset {
+            self.triggered.remove("quota_wrap_up");
+            self.triggered.remove("quota_critical");
+        }
+        // A top-up or account change while idle establishes a new baseline;
+        // session spend and financial steering thresholds remain cumulative.
+        self.account_id = snapshot.account_id.clone();
+        self.last_balance = balance;
+        self.latest = snapshot;
+        self.last_sample = Instant::now();
+        self.paid_now = false;
+        self.phase = Phase::Included;
+        Ok(reset)
+    }
+    pub fn prepare_turn(&mut self) -> Result<()> {
+        if self.spent >= self.profile.credits.max_spend {
+            bail!("session paid-credit budget already reached");
+        }
+        if self.profile.quota.hard_stop {
+            if self.latest.primary.is_none() && self.latest.ordinary_usage_allowed.is_none() {
+                bail!("quota hard stop cannot be enforced without quota telemetry");
+            }
+            if self
+                .latest
+                .primary
+                .as_ref()
+                .is_some_and(|w| w.used >= 100.0)
+                || self.latest.ordinary_usage_allowed == Some(false)
+            {
+                bail!("included quota is exhausted (quota hard stop enabled)");
+            }
+        }
+        self.triggered.remove("quota_wrap_up");
+        self.triggered.remove("quota_critical");
+        self.last_steer = None;
+        self.last_sample = Instant::now();
+        Ok(())
+    }
+    pub fn finish_turn(&mut self) {
+        let now = Instant::now();
+        if self.paid_now {
+            self.paid_runtime += now.duration_since(self.last_sample);
+        }
+        self.last_sample = now;
+        self.paid_now = false;
+        self.phase = Phase::Included;
     }
     pub fn poll_interval(&self) -> Duration {
         let monitor = &self.profile.monitor;
@@ -424,5 +468,47 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::Billing("PAID CREDITS"))));
+    }
+    #[test]
+    fn session_spend_and_baseline_survive_follow_up_turns() {
+        let mut profile = Profile::default();
+        profile.credits.reserve = 0.0;
+        let mut policy = Policy::new(profile, sample(50.0, 1, 100.0, Some(true))).unwrap();
+        policy.prepare_turn().unwrap();
+        policy.observe(sample(100.0, 1, 96.0, Some(false)));
+        policy.finish_turn();
+        assert_eq!(policy.spent, 4.0);
+        policy
+            .observe_idle(sample(100.0, 1, 95.0, Some(false)))
+            .unwrap();
+        assert_eq!(policy.spent, 5.0); // Late charge from the prior turn.
+        policy.prepare_turn().unwrap();
+        policy.observe(sample(100.0, 1, 92.0, Some(false)));
+        assert_eq!(policy.spent, 8.0);
+        policy.finish_turn();
+        policy
+            .observe_idle(sample(2.0, 2, 110.0, Some(true)))
+            .unwrap();
+        assert_eq!(policy.spent, 8.0); // Quota reset and top-up are not refunds.
+        assert_eq!(policy.balance(), 110.0);
+    }
+    #[test]
+    fn ready_can_show_exhausted_quota_but_cannot_start_with_hard_stop() {
+        let mut profile = Profile::default();
+        profile.quota.hard_stop = true;
+        let mut policy = Policy::new(profile, sample(100.0, 1, 0.0, Some(false))).unwrap();
+        assert!(policy.prepare_turn().is_err());
+    }
+    #[test]
+    fn idle_refresh_blocks_new_turn_after_cumulative_budget_is_spent() {
+        let mut profile = Profile::default();
+        profile.credits.max_spend = 5.0;
+        profile.credits.reserve = 0.0;
+        let mut policy = Policy::new(profile, sample(10.0, 1, 100.0, Some(true))).unwrap();
+        policy
+            .observe_idle(sample(10.0, 1, 94.0, Some(true)))
+            .unwrap();
+        assert_eq!(policy.spent, 6.0);
+        assert!(policy.prepare_turn().is_err());
     }
 }

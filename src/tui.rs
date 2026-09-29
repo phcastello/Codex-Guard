@@ -32,11 +32,20 @@ pub struct Tui {
     agent_is_final: bool,
     message_scroll: u16,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Confirm {
     Interrupt,
     Kill,
     Quit,
+}
+
+fn confirmation_for(command: &str, active_turn: bool) -> Option<Confirm> {
+    match command {
+        "/interrupt" if active_turn => Some(Confirm::Interrupt),
+        "/kill" => Some(Confirm::Kill),
+        "/quit" if active_turn => Some(Confirm::Quit),
+        _ => None,
+    }
 }
 
 impl Tui {
@@ -63,7 +72,11 @@ impl Tui {
         self.agent_is_final = is_final;
         self.message_scroll = 0;
     }
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+    pub fn turn_completed(&mut self) {
+        self.input.clear();
+        self.confirm = None;
+    }
+    pub fn handle_key(&mut self, key: KeyEvent, active_turn: bool) -> Option<String> {
         if key.kind != KeyEventKind::Press {
             return None;
         }
@@ -109,21 +122,12 @@ impl Tui {
                     self.notice = "Cancelled".into();
                     return None;
                 }
-                match entered.as_str() {
-                    "/interrupt" => {
-                        self.confirm = Some(Confirm::Interrupt);
-                    }
-                    "/kill" => {
-                        self.confirm = Some(Confirm::Kill);
-                    }
-                    "/quit" => {
-                        self.confirm = Some(Confirm::Quit);
-                    }
-                    "/logs" => {
-                        self.logs_expanded = !self.logs_expanded;
-                    }
-                    "" => {}
-                    _ => return Some(entered),
+                if let Some(confirm) = confirmation_for(&entered, active_turn) {
+                    self.confirm = Some(confirm);
+                } else if entered == "/logs" {
+                    self.logs_expanded = !self.logs_expanded;
+                } else if !entered.is_empty() {
+                    return Some(entered);
                 }
             }
             _ => {}
@@ -133,6 +137,7 @@ impl Tui {
     pub fn draw(
         &mut self,
         policy: &Policy,
+        lifecycle: &str,
         profile: &str,
         mode: &str,
         started: Instant,
@@ -153,7 +158,7 @@ impl Tui {
         let input = self.input.clone();
         let notice = self.notice.clone();
         let agent_text = if self.agent_text.is_empty() {
-            "Waiting for agent message...".to_owned()
+            "No active task. Enter a prompt below to start one.".to_owned()
         } else {
             self.agent_text.clone()
         };
@@ -173,6 +178,7 @@ impl Tui {
         let status = status_lines(
             snapshot,
             policy,
+            lifecycle,
             profile,
             mode,
             started,
@@ -184,7 +190,7 @@ impl Tui {
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(12),
+                    Constraint::Length(13),
                     Constraint::Min(5),
                     Constraint::Length(if self.logs_expanded { 7 } else { 3 }),
                     Constraint::Length(4),
@@ -236,6 +242,7 @@ impl Tui {
 fn status_lines(
     snapshot: &RateSnapshot,
     policy: &Policy,
+    lifecycle: &str,
     profile: &str,
     mode: &str,
     started: Instant,
@@ -302,13 +309,28 @@ fn status_lines(
             )
         })
         .unwrap_or_else(|| "unavailable".into());
-    let text = format!("Status       {} · {profile} · {mode} · {}s\n5h quota     {primary} · {reset}\nWeekly       {weekly}\nBilling      {billing}\nCredits      {:.2} / {:.2} task budget\nAccount      {:.2}\nThread est.  {usage}\nModel/usage  {breakdown}\nLast steer   {}\nTools seen   {tools_done} completed · {tools_running} running", policy.phase.label(), started.elapsed().as_secs(), policy.spent, policy.profile.credits.max_spend, policy.balance(), policy.last_steer.unwrap_or("—"));
+    let text = format!("Status       {lifecycle} · {profile} · {mode} · {}s\nPolicy       {}\n5h quota     {primary} · {reset}\nWeekly       {weekly}\nBilling      {billing}\nCredits      {:.2} / {:.2} session budget\nAccount      {:.2}\nThread est.  {usage}\nModel/usage  {breakdown}\nLast steer   {}\nTools seen   {tools_done} completed · {tools_running} running", started.elapsed().as_secs(), policy.phase.label(), policy.spent, policy.profile.credits.max_spend, policy.balance(), policy.last_steer.unwrap_or("—"));
     text.lines()
         .map(|line| Line::from(line.to_owned()))
         .collect()
 }
 fn u_groups_more(usage: Option<&ThreadUsage>) -> bool {
     usage.is_some_and(|u| u.groups.len() > 1)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn idle_interrupt_and_quit_do_not_request_confirmation() {
+        assert_eq!(confirmation_for("/interrupt", false), None);
+        assert_eq!(confirmation_for("/quit", false), None);
+        assert_eq!(
+            confirmation_for("/interrupt", true),
+            Some(Confirm::Interrupt)
+        );
+        assert_eq!(confirmation_for("/quit", true), Some(Confirm::Quit));
+        assert_eq!(confirmation_for("/kill", false), Some(Confirm::Kill));
+    }
 }
 impl Drop for Tui {
     fn drop(&mut self) {
