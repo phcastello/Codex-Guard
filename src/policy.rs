@@ -78,6 +78,16 @@ impl Policy {
                 "App Server did not provide a numeric credit balance; cannot enforce hard budget"
             )
         })?;
+        if profile.quota.hard_stop {
+            if first.primary.is_none() && first.ordinary_usage_allowed.is_none() {
+                bail!("quota hard stop cannot be enforced without quota telemetry");
+            }
+            if first.primary.as_ref().is_some_and(|w| w.used >= 100.0)
+                || first.ordinary_usage_allowed == Some(false)
+            {
+                bail!("included quota is already exhausted (quota hard stop enabled)");
+            }
+        }
         Ok(Self {
             profile,
             phase: Phase::Included,
@@ -100,6 +110,39 @@ impl Policy {
     }
     pub fn balance(&self) -> f64 {
         self.last_balance
+    }
+    pub fn poll_interval(&self) -> Duration {
+        let monitor = &self.profile.monitor;
+        if self.spent >= self.profile.credits.max_spend * self.profile.credits.urgent_finalize_at
+            || (self.profile.quota.hard_stop
+                && self.latest.primary.as_ref().is_some_and(|w| {
+                    100.0 - w.used <= self.profile.quota.critical_remaining_percent
+                }))
+        {
+            config::duration(&monitor.critical_poll_interval)
+        } else if self.paid_now {
+            config::duration(&monitor.paid_poll_interval)
+        } else if self
+            .latest
+            .primary
+            .as_ref()
+            .is_some_and(|w| 100.0 - w.used <= self.profile.quota.wrap_remaining_percent)
+        {
+            config::duration(&monitor.wrap_poll_interval)
+        } else {
+            config::duration(&monitor.poll_interval)
+        }
+    }
+    pub fn can_tolerate_poll_failure(&self) -> bool {
+        !self.paid_now
+            && !self.profile.quota.hard_stop
+            && self.spent < self.profile.credits.max_spend * self.profile.credits.urgent_finalize_at
+            && self.latest.ordinary_usage_allowed != Some(false)
+            && self
+                .latest
+                .primary
+                .as_ref()
+                .is_some_and(|w| 100.0 - w.used > self.profile.quota.wrap_remaining_percent)
     }
     pub fn observe(&mut self, snapshot: RateSnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -148,8 +191,24 @@ impl Policy {
         let balance = snapshot.balance.unwrap_or(self.last_balance);
         let delta = (self.last_balance - balance).max(0.0);
         self.last_balance = balance;
+        self.spent += delta;
+        if self.profile.quota.hard_stop {
+            let quota_exhausted = snapshot.primary.as_ref().is_some_and(|w| w.used >= 100.0)
+                || snapshot.ordinary_usage_allowed == Some(false)
+                || delta > 0.000001;
+            let quota_unknown =
+                snapshot.primary.is_none() && snapshot.ordinary_usage_allowed.is_none();
+            if quota_exhausted || quota_unknown {
+                actions.push(Action::Stop(if quota_unknown {
+                    "quota telemetry unavailable with hard stop enabled".into()
+                } else {
+                    "quota hard stop reached".into()
+                }));
+                self.latest = snapshot;
+                return actions;
+            }
+        }
         if delta > 0.000001 {
-            self.spent += delta;
             if !self.paid_now {
                 actions.push(Action::Billing("PAID CREDITS"));
             }
@@ -217,9 +276,6 @@ impl Policy {
                     if self.triggered.insert("quota_wrap_up") {
                         actions.push(Action::Steer("quota_wrap_up", QUOTA_WRAP_UP));
                     }
-                }
-                if remaining <= 0.0 && self.profile.quota.hard_stop {
-                    actions.push(Action::Stop("quota hard stop reached".into()));
                 }
             }
         }
@@ -297,5 +353,33 @@ mod tests {
         let actions = policy.observe(sample(100.0, 1, 97.0, Some(false)));
         assert!(actions.iter().any(|x| matches!(x, Action::Stop(_))));
         assert_eq!(policy.spent, 3.0);
+    }
+    #[test]
+    fn quota_hard_stop_precedes_paid_transition() {
+        let mut profile = Profile::default();
+        profile.quota.hard_stop = true;
+        let mut policy = Policy::new(profile, sample(95.0, 1, 100.0, Some(true))).unwrap();
+        let actions = policy.observe(sample(100.0, 1, 99.0, Some(false)));
+        assert!(actions.iter().any(|x| matches!(x, Action::Stop(_))));
+        assert!(!policy.paid_now());
+        assert_eq!(policy.spent, 1.0);
+        assert!(!actions
+            .iter()
+            .any(|x| matches!(x, Action::Steer("credits_started", _))));
+    }
+    #[test]
+    fn poll_interval_tracks_quota_and_credit_risk() {
+        let mut profile = Profile::default();
+        profile.credits.reserve = 0.0;
+        let mut policy = Policy::new(profile, sample(20.0, 1, 100.0, Some(true))).unwrap();
+        assert_eq!(policy.poll_interval(), Duration::from_secs(60));
+        assert!(policy.can_tolerate_poll_failure());
+        policy.observe(sample(86.0, 1, 100.0, Some(true)));
+        assert_eq!(policy.poll_interval(), Duration::from_secs(30));
+        assert!(!policy.can_tolerate_poll_failure());
+        policy.observe(sample(100.0, 1, 99.0, Some(false)));
+        assert_eq!(policy.poll_interval(), Duration::from_secs(10));
+        policy.observe(sample(100.0, 1, 82.0, Some(false)));
+        assert_eq!(policy.poll_interval(), Duration::from_secs(5));
     }
 }

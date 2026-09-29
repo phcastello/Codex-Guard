@@ -11,6 +11,7 @@ pub struct Profile {
     pub credits: Credits,
     pub monitor: Monitor,
     pub burn_rate: BurnRate,
+    pub session: Session,
 }
 impl Default for Profile {
     fn default() -> Self {
@@ -20,6 +21,7 @@ impl Default for Profile {
             credits: Credits::default(),
             monitor: Monitor::default(),
             burn_rate: BurnRate::default(),
+            session: Session::default(),
         }
     }
 }
@@ -77,15 +79,32 @@ impl Default for Credits {
 #[serde(default)]
 pub struct Monitor {
     pub poll_interval: String,
+    pub wrap_poll_interval: String,
+    pub paid_poll_interval: String,
+    pub critical_poll_interval: String,
+    pub retry_interval: String,
+    pub max_consecutive_failures: u32,
     pub bell: bool,
 }
 impl Default for Monitor {
     fn default() -> Self {
         Self {
             poll_interval: "60s".into(),
+            wrap_poll_interval: "30s".into(),
+            paid_poll_interval: "10s".into(),
+            critical_poll_interval: "5s".into(),
+            retry_interval: "5s".into(),
+            max_consecutive_failures: 2,
             bell: true,
         }
     }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    // None means the App Server inherits the user's ordinary Codex config.
+    pub approval_policy: Option<String>,
+    pub sandbox: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -119,6 +138,7 @@ struct FileConfig {
     credits: Option<toml::Value>,
     monitor: Option<toml::Value>,
     burn_rate: Option<toml::Value>,
+    session: Option<toml::Value>,
     #[serde(default)]
     profiles: BTreeMap<String, toml::Value>,
 }
@@ -166,6 +186,7 @@ pub fn load(
         ("credits", file.credits),
         ("monitor", file.monitor),
         ("burn_rate", file.burn_rate),
+        ("session", file.session),
     ] {
         if let Some(part) = part {
             merge(value.get_mut(key).context("missing default section")?, part);
@@ -226,6 +247,10 @@ fn validate(p: &Profile) -> Result<()> {
         &p.runtime.interrupt_grace,
         &p.runtime.terminate_grace,
         &p.monitor.poll_interval,
+        &p.monitor.wrap_poll_interval,
+        &p.monitor.paid_poll_interval,
+        &p.monitor.critical_poll_interval,
+        &p.monitor.retry_interval,
         &p.burn_rate.window,
     ] {
         let d = humantime::parse_duration(x)?;
@@ -252,6 +277,17 @@ fn validate(p: &Profile) -> Result<()> {
     }
     if !p.burn_rate.max_credit_spend.is_finite() || p.burn_rate.max_credit_spend <= 0.0 {
         bail!("invalid burn rate limit");
+    }
+    if p.monitor.max_consecutive_failures > 5 {
+        bail!("max_consecutive_failures must be 0..=5");
+    }
+    if p.session
+        .approval_policy
+        .as_deref()
+        .is_some_and(str::is_empty)
+        || p.session.sandbox.as_deref().is_some_and(str::is_empty)
+    {
+        bail!("session approval_policy/sandbox must not be empty");
     }
     Ok(())
 }

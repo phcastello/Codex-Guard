@@ -7,7 +7,7 @@ mod supervisor;
 mod tui;
 
 use anyhow::{bail, Context, Result};
-use app_server::Client;
+use app_server::{Client, ThreadUsage};
 use clap::Parser;
 use cli::{Cli, Command, ConfigCommand};
 use config::Loaded;
@@ -75,7 +75,7 @@ struct Stop {
 
 async fn run(loaded: Loaded, prompt: String) -> Result<()> {
     let (mut process, stdin, stdout, stderr) = ProcessSupervisor::spawn()?;
-    let (client, mut events) = Client::new(stdin, stdout);
+    let (client, mut events, mut activity) = Client::new(stdin, stdout);
     let (stderr_tx, mut stderr_rx) = mpsc::channel::<String>(64);
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
@@ -90,12 +90,35 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
         let first = client.rate_limits().await?;
         let policy = Policy::new(loaded.profile.clone(), first)?;
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-        let thread = client.call("thread/start", Some(json!({"cwd":cwd,"approvalPolicy":"never","sandbox":"workspaceWrite","serviceName":"codex_guard"}))).await?
-            .pointer("/thread/id").and_then(Value::as_str).context("thread/start did not return thread.id")?.to_owned();
-        let turn = client.call("turn/start", Some(json!({"threadId":thread,"input":[{"type":"text","text":prompt}]}))).await?
-            .pointer("/turn/id").and_then(Value::as_str).context("turn/start did not return turn.id")?.to_owned();
+        let mut thread_params = json!({"cwd":cwd,"serviceName":"codex_guard"});
+        // Omitted overrides inherit the user's normal Codex configuration.
+        // Attended is still partial: unsupported approval requests stop the turn.
+        if let Some(value) = &loaded.profile.session.approval_policy {
+            thread_params["approvalPolicy"] = json!(value);
+        }
+        if let Some(value) = &loaded.profile.session.sandbox {
+            thread_params["sandbox"] = json!(value);
+        }
+        let thread = client
+            .call("thread/start", Some(thread_params))
+            .await?
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .context("thread/start did not return thread.id")?
+            .to_owned();
+        let turn = client
+            .call(
+                "turn/start",
+                Some(json!({"threadId":thread,"input":[{"type":"text","text":prompt}]})),
+            )
+            .await?
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .context("turn/start did not return turn.id")?
+            .to_owned();
         Ok((policy, thread, turn))
-    }.await;
+    }
+    .await;
     let (mut policy, thread, turn) = match startup {
         Ok(x) => x,
         Err(error) => {
@@ -116,6 +139,7 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
         json!({"balance":policy.balance(),"spent":policy.spent}),
     );
     logger.record("quota_snapshot", quota_json(&policy.latest));
+    logger.record("session_settings", json!({"approval_policy":loaded.profile.session.approval_policy,"sandbox":loaded.profile.session.sandbox,"attended_partial":loaded.mode == "ATTENDED"}));
     let mut ui = match Tui::new() {
         Ok(x) => x,
         Err(error) => {
@@ -127,13 +151,28 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
     let started = Instant::now();
     let mut redraw = interval(Duration::from_millis(200));
     redraw.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut poll = interval(config::duration(&policy.profile.monitor.poll_interval));
-    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    poll.tick().await; // first snapshot was already read before task start
+    let mut next_poll = Box::pin(tokio::time::sleep(policy.poll_interval()));
+    let (usage_tx, mut usage_rx) = mpsc::channel(2);
+    let usage_client = client.clone();
+    let usage_thread = thread.clone();
+    let usage_interval = config::duration(&policy.profile.monitor.poll_interval);
+    let usage_task = tokio::spawn(async move {
+        loop {
+            let result = usage_client.thread_usage(&usage_thread).await;
+            if usage_tx.send(result).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(usage_interval).await;
+        }
+    });
     let mut stop: Option<Stop> = None;
+    let mut consecutive_poll_failures = 0_u32;
     let mut result: Option<String> = None;
     let mut tools_done = 0_u64;
     let mut tools_running = 0_u64;
+    let mut thread_usage: Option<ThreadUsage> = None;
+    let mut last_message: Option<String> = None;
+    let mut final_message: Option<String> = None;
     let mut process_exit_seen: Option<Instant> = None;
     let initial_actions = policy.observe(policy.latest.clone());
     apply_actions(
@@ -147,6 +186,9 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
         &turn,
     )
     .await;
+    next_poll
+        .as_mut()
+        .reset(tokio::time::Instant::now() + policy.poll_interval());
 
     loop {
         tokio::select! {
@@ -175,18 +217,12 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
                         break;
                     }
                 }
-                ui.draw(&policy, &loaded.profile_name, &loaded.mode, started, &logger, tools_done, tools_running)?;
+                ui.draw(&policy, &loaded.profile_name, &loaded.mode, started, &logger, thread_usage.as_ref(), tools_done, tools_running)?;
             }
-            _ = poll.tick() => {
-                match client.rate_limits().await {
-                    Ok(snapshot) => {
-                        logger.record("quota_snapshot", quota_json(&snapshot));
-                        logger.record("credit_snapshot", json!({"balance":snapshot.balance,"task_spent":policy.spent}));
-                        let actions = policy.observe(snapshot);
-                        apply_actions(actions, &client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn).await;
-                    }
-                    Err(error) => { logger.record("error", json!({"poll":error.to_string()})); begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, "rate-limit polling failed".into()).await; }
-                }
+            _ = &mut next_poll => {
+                let success = reconcile_rate_limits(&client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn, &mut consecutive_poll_failures).await;
+                let delay = if success { policy.poll_interval() } else { config::duration(&policy.profile.monitor.retry_interval) };
+                next_poll.as_mut().reset(tokio::time::Instant::now() + delay);
             }
             maybe = events.recv() => {
                 let Some(event) = maybe else { policy.phase = Phase::Failed; result = Some("App Server event stream closed".into()); break; };
@@ -203,30 +239,46 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
                         }
                     }
                     "account/rateLimits/updated" => {
-                        match client.rate_limits().await {
-                            Ok(snapshot) => {
-                                logger.record("quota_snapshot", quota_json(&snapshot));
-                                logger.record("credit_snapshot", json!({"balance":snapshot.balance,"task_spent":policy.spent}));
-                                let actions = policy.observe(snapshot);
-                                apply_actions(actions, &client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn).await;
-                            }
-                            Err(error) => { logger.record("error", json!({"event_reconciliation":error.to_string()})); begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, "rate-limit reconciliation failed".into()).await; }
+                        client.ack_rate_update();
+                        let success = reconcile_rate_limits(&client, &mut policy, &mut logger, &mut ui, &mut stop, &thread, &turn, &mut consecutive_poll_failures).await;
+                        let delay = if success { policy.poll_interval() } else { config::duration(&policy.profile.monitor.retry_interval) };
+                        next_poll.as_mut().reset(tokio::time::Instant::now() + delay);
+                    }
+                    "item/completed" => {
+                        if let Some((message, is_final)) = agent_message(&event.params) {
+                            logger.record("agent_message", json!({"phase":if is_final {"final_answer"} else {"commentary"},"text":message}));
+                            ui.agent_message(&message, is_final);
+                            last_message = Some(message.clone());
+                            if is_final { final_message = Some(message); }
                         }
                     }
-                    "item/started" | "item/completed" => {
-                        if let Some(item) = event.params.get("item") {
-                            let kind = item.get("type").and_then(Value::as_str).unwrap_or("item");
-                            if matches!(kind, "commandExecution" | "fileChange" | "dynamicToolCall") {
-                                if event.method == "item/started" { tools_running += 1; }
-                                else { tools_done += 1; tools_running = tools_running.saturating_sub(1); }
-                                let detail = item.get("command").or_else(|| item.get("changes")).unwrap_or(item).to_string();
-                                logger.record(if event.method == "item/started" { "tool_start" } else { "tool_complete" }, json!({"type":kind,"detail":detail.chars().take(500).collect::<String>()}));
-                            } else if kind == "agentMessage" && event.method == "item/completed" { logger.record("agent_message", json!(item.to_string().chars().take(500).collect::<String>())); }
-                        }
+                    "guard/unsupportedRequest" => {
+                        let method = event.params.get("method").and_then(Value::as_str).unwrap_or("unknown");
+                        logger.record("error", json!({"unsupported_server_request":method}));
+                        begin_stop(&client, &mut policy, &mut logger, &mut stop, &thread, &turn, format!("unsupported App Server request: {method}")).await;
                     }
                     "guard/disconnected" | "guard/transportError" => { logger.record("error", json!({"transport":event.params})); policy.phase = Phase::Failed; result = Some("App Server disconnected".into()); break; }
                     "error" => logger.record("error", event.params),
                     _ => {},
+                }
+            }
+            maybe = activity.recv(), if !activity.is_closed() => {
+                if let Some(event) = maybe {
+                    if let Some(item) = event.params.get("item") {
+                        let kind = item.get("type").and_then(Value::as_str).unwrap_or("item");
+                        if event.method == "item/started" { tools_running += 1; }
+                        else { tools_done += 1; tools_running = tools_running.saturating_sub(1); }
+                        let detail = item.get("command").or_else(|| item.get("changes")).unwrap_or(item).to_string();
+                        logger.record(if event.method == "item/started" { "tool_start" } else { "tool_complete" }, json!({"type":kind,"detail":detail.chars().take(500).collect::<String>()}));
+                    }
+                }
+            }
+            maybe = usage_rx.recv(), if !usage_rx.is_closed() => {
+                match maybe {
+                    Some(Ok(Some(usage))) => { logger.record("thread_usage", json!(usage)); thread_usage = Some(usage); }
+                    Some(Ok(None)) => { /* Optional telemetry is unavailable for this billing route. */ }
+                    Some(Err(error)) => { logger.record("warning", json!({"thread_usage":error.to_string()})); }
+                    None => {},
                 }
             }
             Some(line) = stderr_rx.recv() => { logger.record("app_server_stderr", json!(line.chars().take(500).collect::<String>())); }
@@ -238,6 +290,17 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
                     }
                 }
             }
+        }
+    }
+    usage_task.abort();
+    if process.try_wait()?.is_none() {
+        match client.thread_usage(&thread).await {
+            Ok(Some(usage)) => {
+                logger.record("thread_usage", json!(usage));
+                thread_usage = Some(usage);
+            }
+            Ok(None) => {}
+            Err(error) => logger.record("warning", json!({"final_thread_usage":error.to_string()})),
         }
     }
     // Reconcile once more before closing the server so the final summary includes late charges.
@@ -276,14 +339,102 @@ async fn run(loaded: Loaded, prompt: String) -> Result<()> {
         }
     }
     let result = result.unwrap_or_else(|| "unknown".into());
-    logger.record("summary", json!({"result":result,"runtime_seconds":started.elapsed().as_secs(),"paid_runtime_seconds":policy.paid_runtime.as_secs(),"credits_spent":policy.spent,"automatic_steers":policy.automatic_steers,"quota_initial":policy.first.primary.as_ref().map(|x|x.used),"quota_final":policy.latest.primary.as_ref().map(|x|x.used)}));
+    logger.record("summary", json!({"result":result,"runtime_seconds":started.elapsed().as_secs(),"paid_runtime_seconds":policy.paid_runtime.as_secs(),"credits_spent":policy.spent,"thread_usage":thread_usage,"automatic_steers":policy.automatic_steers,"quota_initial":policy.first.primary.as_ref().map(|x|x.used),"quota_final":policy.latest.primary.as_ref().map(|x|x.used)}));
     drop(ui);
     println!("Task {result}\nRuntime: {}s\nPaid runtime (sampled): {}s\nCredits spent: {:.2} / {:.2}\n5h usage: {} → {}\nAutomatic steers: {}\nLog: {}", started.elapsed().as_secs(), policy.paid_runtime.as_secs(), policy.spent, policy.profile.credits.max_spend, policy.first.primary.as_ref().map(|x|format!("{:.0}%",x.used)).unwrap_or_else(||"?".into()), policy.latest.primary.as_ref().map(|x|format!("{:.0}%",x.used)).unwrap_or_else(||"?".into()), policy.automatic_steers, logger.path.display());
+    let has_final = final_message.is_some();
+    if let Some(message) = final_message.or(last_message) {
+        println!(
+            "\n{}:\n\n{message}",
+            if has_final {
+                "Final agent response"
+            } else {
+                "Last agent message"
+            }
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn extracts_full_agent_text_and_final_phase() {
+        let text = "Completed work\n\nRemaining work:\n- run manual validation";
+        let params = json!({"item":{"type":"agentMessage","text":text,"phase":"final_answer"}});
+        assert_eq!(agent_message(&params), Some((text.into(), true)));
+        assert!(agent_message(&json!({"item":{"type":"commandExecution","text":text}})).is_none());
+    }
 }
 
 fn quota_json(snapshot: &app_server::RateSnapshot) -> Value {
     json!({"primary_used":snapshot.primary.as_ref().map(|x|x.used),"primary_resets_at":snapshot.primary.as_ref().and_then(|x|x.resets_at),"secondary_used":snapshot.secondary.as_ref().map(|x|x.used),"ordinary_usage_allowed":snapshot.ordinary_usage_allowed})
+}
+fn agent_message(params: &Value) -> Option<(String, bool)> {
+    let item = params.get("item")?;
+    if item.get("type")?.as_str()? != "agentMessage" {
+        return None;
+    }
+    let text = item.get("text")?.as_str()?;
+    if text.is_empty() {
+        return None;
+    }
+    let is_final = item.get("phase").and_then(Value::as_str) == Some("final_answer");
+    Some((text.to_owned(), is_final))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_rate_limits(
+    client: &Client,
+    policy: &mut Policy,
+    logger: &mut Logger,
+    ui: &mut Tui,
+    stop: &mut Option<Stop>,
+    thread: &str,
+    turn: &str,
+    failures: &mut u32,
+) -> bool {
+    match client.rate_limits().await {
+        Ok(snapshot) => {
+            *failures = 0;
+            logger.record("quota_snapshot", quota_json(&snapshot));
+            let actions = policy.observe(snapshot);
+            logger.record(
+                "credit_snapshot",
+                json!({"balance":policy.latest.balance,"task_spent":policy.spent}),
+            );
+            apply_actions(actions, client, policy, logger, ui, stop, thread, turn).await;
+            true
+        }
+        Err(error) => {
+            *failures = failures.saturating_add(1);
+            let tolerated = policy.can_tolerate_poll_failure()
+                && *failures <= policy.profile.monitor.max_consecutive_failures;
+            logger.record(
+                if tolerated { "warning" } else { "error" },
+                json!({"rate_limit_poll":error.to_string(),"consecutive_failures":*failures}),
+            );
+            if tolerated {
+                ui.notice(format!(
+                    "Rate-limit read failed ({}/{}); retrying soon",
+                    failures, policy.profile.monitor.max_consecutive_failures
+                ));
+            } else {
+                begin_stop(
+                    client,
+                    policy,
+                    logger,
+                    stop,
+                    thread,
+                    turn,
+                    "rate-limit telemetry unavailable".into(),
+                )
+                .await;
+            }
+            false
+        }
+    }
 }
 async fn apply_actions(
     actions: Vec<Action>,

@@ -1,4 +1,8 @@
-use crate::{app_server::RateSnapshot, logging::Logger, policy::Policy};
+use crate::{
+    app_server::{RateSnapshot, ThreadUsage},
+    logging::Logger,
+    policy::Policy,
+};
 use anyhow::Result;
 use crossterm::{
     event::{KeyCode, KeyEvent, KeyEventKind},
@@ -24,6 +28,9 @@ pub struct Tui {
     confirm: Option<Confirm>,
     logs_expanded: bool,
     notice: String,
+    agent_text: String,
+    agent_is_final: bool,
+    message_scroll: u16,
 }
 #[derive(Clone, Copy)]
 enum Confirm {
@@ -43,10 +50,18 @@ impl Tui {
             confirm: None,
             logs_expanded: false,
             notice: String::new(),
+            agent_text: String::new(),
+            agent_is_final: false,
+            message_scroll: 0,
         })
     }
     pub fn notice(&mut self, message: impl Into<String>) {
         self.notice = message.into();
+    }
+    pub fn agent_message(&mut self, text: &str, is_final: bool) {
+        self.agent_text = text.to_owned();
+        self.agent_is_final = is_final;
+        self.message_scroll = 0;
     }
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         if key.kind != KeyEventKind::Press {
@@ -66,6 +81,12 @@ impl Tui {
             KeyCode::Esc => {
                 self.input.clear();
                 self.confirm = None;
+            }
+            KeyCode::PageDown => {
+                self.message_scroll = self.message_scroll.saturating_add(5);
+            }
+            KeyCode::PageUp => {
+                self.message_scroll = self.message_scroll.saturating_sub(5);
             }
             KeyCode::Enter => {
                 let entered = std::mem::take(&mut self.input);
@@ -116,6 +137,7 @@ impl Tui {
         mode: &str,
         started: Instant,
         logger: &Logger,
+        thread_usage: Option<&ThreadUsage>,
         tools_done: u64,
         tools_running: u64,
     ) -> Result<()> {
@@ -130,6 +152,17 @@ impl Tui {
         };
         let input = self.input.clone();
         let notice = self.notice.clone();
+        let agent_text = if self.agent_text.is_empty() {
+            "Waiting for agent message...".to_owned()
+        } else {
+            self.agent_text.clone()
+        };
+        let agent_title = if self.agent_is_final {
+            " Final agent message (PgUp/PgDn) "
+        } else {
+            " Agent message (PgUp/PgDn) "
+        };
+        let message_scroll = self.message_scroll;
         let rows: Vec<String> = logger
             .recent
             .iter()
@@ -143,6 +176,7 @@ impl Tui {
             profile,
             mode,
             started,
+            thread_usage,
             tools_done,
             tools_running,
         );
@@ -150,9 +184,10 @@ impl Tui {
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(14),
+                    Constraint::Length(12),
                     Constraint::Min(5),
-                    Constraint::Length(3),
+                    Constraint::Length(if self.logs_expanded { 7 } else { 3 }),
+                    Constraint::Length(4),
                 ])
                 .split(frame.area());
             let title = format!(" Codex Guard · {} · {} ", profile, mode);
@@ -168,10 +203,17 @@ impl Tui {
                 " Recent events /logs "
             };
             frame.render_widget(
+                Paragraph::new(agent_text)
+                    .block(Block::default().title(agent_title).borders(Borders::ALL))
+                    .wrap(Wrap { trim: false })
+                    .scroll((message_scroll, 0)),
+                vertical[1],
+            );
+            frame.render_widget(
                 Paragraph::new(rows.join("\n"))
                     .block(Block::default().title(log_title).borders(Borders::ALL))
                     .wrap(Wrap { trim: true }),
-                vertical[1],
+                vertical[2],
             );
             let command = Paragraph::new(vec![
                 Line::from(vec![
@@ -186,7 +228,7 @@ impl Tui {
                 Line::from(notice),
             ])
             .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(command, vertical[2]);
+            frame.render_widget(command, vertical[3]);
         })?;
         Ok(())
     }
@@ -197,6 +239,7 @@ fn status_lines(
     profile: &str,
     mode: &str,
     started: Instant,
+    thread_usage: Option<&ThreadUsage>,
     tools_done: u64,
     tools_running: u64,
 ) -> Vec<Line<'static>> {
@@ -231,10 +274,41 @@ fn status_lines(
     } else {
         "INCLUDED"
     };
-    let text = format!("{profile} · {mode}                         {}\nStatus       {}\n5h quota     {primary}\n             {reset}\nWeekly       {weekly}\nBilling      {billing}\nCredits      {:.2} / {:.2} task budget\nAccount      {:.2}\nLast steer   {}\nTools        {tools_done} completed · {tools_running} running\nRuntime      {}s", started.elapsed().as_secs(), policy.phase.label(), policy.spent, policy.profile.credits.max_spend, policy.balance(), policy.last_steer.unwrap_or("—"), started.elapsed().as_secs());
+    let usage = thread_usage
+        .map(|u| {
+            let credits = u.estimated_usage_credits_micros as f64 / 1_000_000.0;
+            let usd = u
+                .estimated_usage_usd_micros
+                .map(|x| format!(" · ${:.4}", x as f64 / 1_000_000.0))
+                .unwrap_or_default();
+            format!("{credits:.3} credits{usd}")
+        })
+        .unwrap_or_else(|| "unavailable".into());
+    let breakdown = thread_usage
+        .and_then(|u| u.groups.first())
+        .map(|g| {
+            format!(
+                "{} · {} · {} tokens{}",
+                g.model.as_deref().unwrap_or("unknown model"),
+                g.reasoning_effort.as_deref().unwrap_or("unknown effort"),
+                g.total_tokens
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                if u_groups_more(thread_usage) {
+                    " (+more groups)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .unwrap_or_else(|| "unavailable".into());
+    let text = format!("Status       {} · {profile} · {mode} · {}s\n5h quota     {primary} · {reset}\nWeekly       {weekly}\nBilling      {billing}\nCredits      {:.2} / {:.2} task budget\nAccount      {:.2}\nThread est.  {usage}\nModel/usage  {breakdown}\nLast steer   {}\nTools seen   {tools_done} completed · {tools_running} running", policy.phase.label(), started.elapsed().as_secs(), policy.spent, policy.profile.credits.max_spend, policy.balance(), policy.last_steer.unwrap_or("—"));
     text.lines()
         .map(|line| Line::from(line.to_owned()))
         .collect()
+}
+fn u_groups_more(usage: Option<&ThreadUsage>) -> bool {
+    usage.is_some_and(|u| u.groups.len() > 1)
 }
 impl Drop for Tui {
     fn drop(&mut self) {
