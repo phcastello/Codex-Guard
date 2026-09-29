@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use app_server::{Client, ThreadUsage};
 use clap::Parser;
 use cli::{Cli, Command, ConfigCommand};
-use config::Loaded;
+use config::{CodexMode, Loaded};
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use logging::Logger;
@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         cli.run.time.as_deref(),
         cli.run.attended,
         cli.run.no_bell,
+        cli.run.yolo,
     )?;
     match cli.command {
         Some(Command::Config {
@@ -107,16 +108,58 @@ enum UserInput {
     Empty,
 }
 fn classify_input(text: String, state: SessionState) -> UserInput {
-    let text = text.trim().to_owned();
-    if text.is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         UserInput::Empty
-    } else if text.starts_with('/') {
-        UserInput::Command(text)
+    } else if trimmed.starts_with('/') {
+        UserInput::Command(trimmed.to_owned())
     } else if state.active() {
         UserInput::SteerRequired
     } else {
         UserInput::Prompt(text)
     }
+}
+
+fn thread_start_params(loaded: &Loaded, cwd: String) -> Value {
+    let mut params = json!({"cwd":cwd,"serviceName":"codex_guard"});
+    match loaded.profile.codex.mode {
+        CodexMode::Yolo => {
+            params["approvalPolicy"] = json!("never");
+            // thread/start.sandbox uses the CLI-style kebab-case enum.
+            // turn/start.sandboxPolicy.type uses a different, camel-case enum.
+            params["sandbox"] = json!("danger-full-access");
+        }
+        CodexMode::Inherit => {
+            if let Some(value) = &loaded.profile.session.approval_policy {
+                params["approvalPolicy"] = json!(value);
+            }
+            if let Some(value) = &loaded.profile.session.sandbox {
+                params["sandbox"] = json!(value);
+            }
+        }
+    }
+    params
+}
+
+fn turn_start_params(loaded: &Loaded, thread_id: &str, prompt: &str) -> Value {
+    let mut params = json!({"threadId":thread_id,"input":[{"type":"text","text":prompt}]});
+    if loaded.profile.codex.mode == CodexMode::Yolo {
+        params["approvalPolicy"] = json!("never");
+        params["sandboxPolicy"] = json!({"type":"dangerFullAccess"});
+    }
+    params
+}
+
+fn discard_thread(
+    thread: &mut Option<String>,
+    thread_usage: &mut Option<ThreadUsage>,
+    tools_done: &mut u64,
+    tools_running: &mut u64,
+) -> Option<String> {
+    *thread_usage = None;
+    *tools_done = 0;
+    *tools_running = 0;
+    thread.take()
 }
 
 struct Stop {
@@ -168,7 +211,7 @@ impl Stop {
 }
 
 async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
-    let (mut process, stdin, stdout, stderr) = ProcessSupervisor::spawn()?;
+    let (mut process, stdin, stdout, stderr) = ProcessSupervisor::spawn(loaded.profile.codex.mode)?;
     let (client, mut events, mut activity) = Client::new(stdin, stdout);
     let (stderr_tx, mut stderr_rx) = mpsc::channel::<String>(64);
     tokio::spawn(async move {
@@ -201,7 +244,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
     };
     logger.record(
         "session_start",
-        json!({"profile":loaded.profile_name,"mode":loaded.mode,"pid":process.id()}),
+        json!({"profile":loaded.profile_name,"mode":loaded.mode,"codex_mode":loaded.profile.codex.mode.label(),"pid":process.id(),"cwd":std::env::current_dir()?.display().to_string(),"executable":process.executable().display().to_string(),"app_server_args":process.arguments(),"path":std::env::var_os("PATH").map(|value|value.to_string_lossy().into_owned())}),
     );
     logger.record(
         "credit_snapshot",
@@ -231,6 +274,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
     let mut turn_started: Option<Instant> = None;
     let mut turns = 0_u32;
     let mut quit_after_stop = false;
+    let mut clear_after_stop = false;
     let mut stop: Option<Stop> = None;
     let mut consecutive_poll_failures = 0_u32;
     let mut result: Option<String> = None;
@@ -314,7 +358,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
                         break;
                     }
                 }
-                ui.draw(&policy, state.label(), &loaded.profile_name, &loaded.mode, started, &logger, thread_usage.as_ref(), tools_done, tools_running)?;
+                ui.draw(&policy, state.label(), &loaded.profile_name, &loaded.mode, loaded.profile.codex.mode, started, &logger, thread_usage.as_ref(), tools_done, tools_running)?;
             }
             _ = &mut next_poll, if stop.is_none() => {
                 let success = if let (Some(thread_id), Some(turn_id)) = (thread.as_deref(), turn.as_deref()) {
@@ -335,7 +379,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
                             let status = event.params.pointer("/turn/status").and_then(Value::as_str).unwrap_or("unknown");
                             let error = event.params.pointer("/turn/error/message").and_then(Value::as_str);
                             logger.record("turn_completion", json!({"thread":thread,"turn":turn,"status":status,"error":error}));
-                            ui.notice(match error { Some(error) => format!("Turn {status}: {error}"), None => format!("Turn {status}. Enter another prompt or /quit.") });
+                            ui.notice(match error { Some(error) => format!("Turn {status}: {error}"), None => format!("Turn {status}. Type another prompt and send with Ctrl+D or F2.") });
                             // Reconcile the last debit while the completed turn still owns it.
                             match client.rate_limits().await {
                                 Ok(snapshot) => {
@@ -353,6 +397,14 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
                             state.turn_completed();
                             next_poll.as_mut().reset(tokio::time::Instant::now() + session_poll_interval(&policy, state));
                             if quit_after_stop { result = Some("quit after interrupt".into()); break; }
+                            if clear_after_stop {
+                                if let Some(task) = usage_task.take() { task.abort(); }
+                                let old = discard_thread(&mut thread, &mut thread_usage, &mut tools_done, &mut tools_running);
+                                logger.record("thread_cleared", json!({"old_thread_id":old}));
+                                ui.clear_thread();
+                                clear_after_stop = false;
+                                state = SessionState::Ready;
+                            }
                         }
                     }
                     "account/rateLimits/updated" => {
@@ -400,19 +452,19 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
             }
             maybe = usage_rx.recv(), if !usage_rx.is_closed() => {
                 match maybe {
-                    Some(Ok(Some(usage))) => { logger.record("thread_usage", json!(usage)); thread_usage = Some(usage); }
-                    Some(Ok(None)) => { /* Optional telemetry is unavailable for this billing route. */ }
-                    Some(Err(error)) => { logger.record("warning", json!({"thread_usage":error.to_string()})); }
+                    Some((thread_id, Ok(Some(usage)))) if thread.as_deref() == Some(&thread_id) => { logger.record("thread_usage", json!(usage)); thread_usage = Some(usage); }
+                    Some((thread_id, Err(error))) if thread.as_deref() == Some(&thread_id) => { logger.record("warning", json!({"thread_usage":error.to_string()})); }
+                    Some(_) => { /* Stale or unavailable optional telemetry. */ }
                     None => {},
                 }
             }
             Some(line) = stderr_rx.recv() => { logger.record("app_server_stderr", json!(line.chars().take(500).collect::<String>())); }
             maybe = input.next() => {
-                if let Some(Ok(crossterm::event::Event::Key(key))) = maybe {
-                    if let Some(text) = ui.handle_key(key, state.active()) {
+                if let Some(Ok(event)) = maybe {
+                    if let Some(text) = ui.handle_event(event, state.active()) {
                         match classify_input(text, state) {
                             UserInput::Prompt(prompt) => {
-                                match start_turn(&client, &loaded, &mut policy, &mut logger, &mut ui, &mut thread, &mut turn, &mut stop, &mut state, &mut turn_started, &mut turns, prompt).await {
+                                match start_turn(&client, &loaded, &mut policy, &mut logger, &mut ui, &mut thread, &mut turn, &mut stop, &mut state, &mut turn_started, &mut turns, prompt.clone()).await {
                                     Ok(()) => {
                                         if usage_task.is_none() {
                                             if let Some(thread_id) = thread.as_ref() {
@@ -424,12 +476,27 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
                                         tools_running = 0;
                                         consecutive_poll_failures = 0;
                                     }
-                                    Err(error) => { logger.record("error", json!({"start_turn":error.to_string()})); ui.notice(format!("Could not start task: {error}")); }
+                                    Err(error) => { logger.record("error", json!({"start_turn":error.to_string()})); ui.restore_input(&prompt); ui.notice(format!("Could not start task: {error}")); }
                                 }
                             }
                             UserInput::SteerRequired => ui.notice("A task is running. Use /steer <message> to guide the active turn."),
                             UserInput::Command(command) => {
-                                if handle_command(&command, &client, &mut process, &mut policy, &mut logger, &mut ui, &mut stop, thread.as_deref(), turn.as_deref(), &loaded, &mut quit_after_stop).await? {
+                                if command == "/clear" || command == "/clear-confirmed" {
+                                    if let (Some(thread_id), Some(turn_id)) = (thread.as_deref(), turn.as_deref()) {
+                                        if command == "/clear-confirmed" {
+                                            clear_after_stop = true;
+                                            begin_stop(&client, &mut policy, &mut logger, &mut stop, thread_id, turn_id, "user cleared active thread".into());
+                                            state = SessionState::Stopping;
+                                            ui.notice("Interrupting turn before clearing thread.");
+                                        }
+                                    } else {
+                                        if let Some(task) = usage_task.take() { task.abort(); }
+                                        let old = discard_thread(&mut thread, &mut thread_usage, &mut tools_done, &mut tools_running);
+                                        logger.record("thread_cleared", json!({"old_thread_id":old}));
+                                        ui.clear_thread();
+                                        state = SessionState::Ready;
+                                    }
+                                } else if handle_command(&command, &client, &mut process, &mut policy, &mut logger, &mut ui, &mut stop, thread.as_deref(), turn.as_deref(), &loaded, &mut quit_after_stop).await? {
                                     result = Some(if command == "/kill-confirmed" { "killed by user" } else { "closed" }.into());
                                     break;
                                 }
@@ -515,13 +582,13 @@ fn session_poll_interval(policy: &Policy, state: SessionState) -> Duration {
 fn spawn_usage_poll(
     client: Client,
     thread: String,
-    sender: mpsc::Sender<Result<Option<ThreadUsage>>>,
+    sender: mpsc::Sender<(String, Result<Option<ThreadUsage>>)>,
     interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             if sender
-                .send(client.thread_usage(&thread).await)
+                .send((thread.clone(), client.thread_usage(&thread).await))
                 .await
                 .is_err()
             {
@@ -589,13 +656,7 @@ async fn start_turn(
     policy.prepare_turn()?;
     if thread.is_none() {
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-        let mut params = json!({"cwd":cwd,"serviceName":"codex_guard"});
-        if let Some(value) = &loaded.profile.session.approval_policy {
-            params["approvalPolicy"] = json!(value);
-        }
-        if let Some(value) = &loaded.profile.session.sandbox {
-            params["sandbox"] = json!(value);
-        }
+        let params = thread_start_params(loaded, cwd);
         let id = client
             .call("thread/start", Some(params))
             .await?
@@ -610,7 +671,7 @@ async fn start_turn(
     let turn_id = client
         .call(
             "turn/start",
-            Some(json!({"threadId":thread_id,"input":[{"type":"text","text":prompt}]})),
+            Some(turn_start_params(loaded, thread_id, &prompt)),
         )
         .await?
         .pointer("/turn/id")
@@ -656,6 +717,9 @@ mod tests {
                 .unwrap();
         assert!(override_only.run.prompt.is_empty());
         assert_eq!(override_only.run.profile.as_deref(), Some("conservative"));
+        let yolo = Cli::try_parse_from(["codex-guard", "--yolo"]).unwrap();
+        assert!(yolo.run.yolo);
+        assert!(yolo.run.prompt.is_empty());
     }
     #[test]
     fn ready_prompt_running_text_and_follow_up_routing() {
@@ -663,6 +727,10 @@ mod tests {
         assert_eq!(
             classify_input("fix the bug".into(), state),
             UserInput::Prompt("fix the bug".into())
+        );
+        assert_eq!(
+            classify_input("  code:\n  x = 1\n".into(), state),
+            UserInput::Prompt("  code:\n  x = 1\n".into())
         );
         state.turn_started();
         assert_eq!(
@@ -694,6 +762,78 @@ mod tests {
             classify_input("/quit".into(), SessionState::Ready),
             UserInput::Command("/quit".into())
         );
+        assert_eq!(
+            classify_input("/clear".into(), SessionState::Completed),
+            UserInput::Command("/clear".into())
+        );
+    }
+    #[test]
+    fn clear_discards_context_not_financial_session() {
+        let snapshot = app_server::RateSnapshot {
+            primary: None,
+            secondary: None,
+            balance: Some(10.0),
+            has_credits: Some(true),
+            unlimited: false,
+            ordinary_usage_allowed: Some(true),
+            account_id: Some("account".into()),
+        };
+        let mut policy = Policy::new(config::Profile::default(), snapshot).unwrap();
+        policy.spent = 3.0;
+        let budget = policy.profile.credits.max_spend;
+        let baseline = policy.balance();
+        for mut state in [SessionState::Ready, SessionState::Completed] {
+            assert!(!state.active());
+            let mut thread = Some("old-thread".to_owned());
+            let mut usage = None;
+            let mut done = 7;
+            let mut running = 1;
+            assert_eq!(
+                discard_thread(&mut thread, &mut usage, &mut done, &mut running).as_deref(),
+                Some("old-thread")
+            );
+            state = SessionState::Ready;
+            assert_eq!(state, SessionState::Ready);
+            assert!(thread.is_none()); // The next start_turn must call thread/start.
+            assert_eq!((done, running), (0, 0));
+        }
+        assert_eq!(policy.spent, 3.0);
+        assert_eq!(policy.profile.credits.max_spend, budget);
+        assert_eq!(policy.balance(), baseline);
+    }
+    #[test]
+    fn codex_mode_overrides_are_explicit_and_financially_independent() {
+        let mut loaded = Loaded {
+            profile_name: "default".into(),
+            mode: "UNATTENDED".into(),
+            profile: config::Profile::default(),
+            path: std::path::PathBuf::new(),
+            names: vec![],
+        };
+        let budget = loaded.profile.credits.max_spend;
+        let inherit_thread = thread_start_params(&loaded, "cwd".into());
+        assert!(inherit_thread.get("approvalPolicy").is_none());
+        assert!(inherit_thread.get("sandbox").is_none());
+        assert!(turn_start_params(&loaded, "thread", "prompt")
+            .get("sandboxPolicy")
+            .is_none());
+        assert_eq!(
+            supervisor::app_server_arguments(CodexMode::Inherit),
+            ["app-server", "--stdio"]
+        );
+        loaded.profile.codex.mode = CodexMode::Yolo;
+        assert_eq!(
+            supervisor::app_server_arguments(CodexMode::Yolo),
+            ["--yolo", "app-server", "--stdio"]
+        );
+        let thread = thread_start_params(&loaded, "cwd".into());
+        assert_eq!(thread["approvalPolicy"], "never");
+        assert_eq!(thread["sandbox"], "danger-full-access");
+        let turn = turn_start_params(&loaded, "thread", "prompt");
+        assert_eq!(turn["approvalPolicy"], "never");
+        assert_eq!(turn["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert_ne!(thread["sandbox"], turn["sandboxPolicy"]["type"]);
+        assert_eq!(loaded.profile.credits.max_spend, budget);
     }
     #[test]
     fn extracts_full_agent_text_and_final_phase() {
@@ -878,7 +1018,7 @@ async fn handle_command(
 ) -> Result<bool> {
     if command == "/help" {
         ui.notice(
-            "/help /status /logs /steer <text> /budget <credits> /profile /interrupt /kill /quit",
+            "/help /status /logs /steer <text> /budget <credits> /profile /clear /interrupt /kill /quit · Enter newline · Ctrl+D/F2 send",
         );
     } else if command == "/status" {
         ui.notice(format!(
@@ -890,9 +1030,10 @@ async fn handle_command(
         ));
     } else if command == "/profile" {
         ui.notice(format!(
-            "{} · {} · config {}",
+            "{} · {} · Codex {} · config {}",
             loaded.profile_name,
             loaded.mode,
+            loaded.profile.codex.mode.label(),
             loaded.path.display()
         ));
     } else if command == "/steer" || command.starts_with("/steer ") {

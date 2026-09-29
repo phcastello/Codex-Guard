@@ -1,4 +1,6 @@
+use crate::config::CodexMode;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 #[cfg(unix)]
@@ -11,14 +13,30 @@ pub struct ProcessSupervisor {
     #[cfg(windows)]
     job: windows::Job,
     pid: u32,
+    executable: PathBuf,
+    arguments: Vec<&'static str>,
+}
+
+pub fn app_server_arguments(mode: CodexMode) -> Vec<&'static str> {
+    let mut args = Vec::new();
+    if mode == CodexMode::Yolo {
+        args.push("--yolo");
+    }
+    args.extend(["app-server", "--stdio"]);
+    args
 }
 
 impl ProcessSupervisor {
-    pub fn spawn() -> Result<(Self, ChildStdin, ChildStdout, ChildStderr)> {
-        let mut command = Command::new("codex");
+    pub fn spawn(mode: CodexMode) -> Result<(Self, ChildStdin, ChildStdout, ChildStderr)> {
+        #[cfg(windows)]
+        let executable = windows::find_codex_executable()?;
+        #[cfg(unix)]
+        let executable =
+            std::env::var_os("CODEX_GUARD_CODEX_PATH").unwrap_or_else(|| "codex".into());
+        let mut command = Command::new(&executable);
+        let arguments = app_server_arguments(mode);
         command
-            .arg("app-server")
-            .arg("--stdio")
+            .args(&arguments)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -27,7 +45,12 @@ impl ProcessSupervisor {
         unix::configure(&mut command);
         #[cfg(windows)]
         windows::configure(&mut command);
-        let mut child = command.spawn().context("spawn codex app-server")?;
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "spawn Codex App Server using {}",
+                std::path::Path::new(&executable).display()
+            )
+        })?;
         let pid = child.id().context("child PID unavailable")?;
         #[cfg(windows)]
         let job = match windows::Job::assign(&child) {
@@ -46,6 +69,8 @@ impl ProcessSupervisor {
                 #[cfg(windows)]
                 job,
                 pid,
+                executable: PathBuf::from(executable),
+                arguments,
             },
             stdin,
             stdout,
@@ -54,6 +79,12 @@ impl ProcessSupervisor {
     }
     pub fn id(&self) -> u32 {
         self.pid
+    }
+    pub fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+    pub fn arguments(&self) -> &[&'static str] {
+        &self.arguments
     }
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
         Ok(self.child.try_wait()?)

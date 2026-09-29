@@ -2,7 +2,7 @@
 
 Codex Guard is a small interactive terminal frontend for a Codex App Server process that it starts and owns. It watches the included quota and the account credit balance, steers a running turn near thresholds, and interrupts when the session's paid-credit budget is reached.
 
-This is an MVP. It requires a recent `codex` executable on `PATH`, authenticated with ChatGPT, and a terminal supporting crossterm. It uses the documented stdio App Server protocol. The implementation was checked against `codex-cli 0.159.0` and its generated v2 JSON schema.
+This is an MVP. It requires a recent Codex CLI installation authenticated with ChatGPT and a terminal supporting crossterm. On Windows, the Guard finds the native `codex.exe` inside a standard global npm installation even when only npm's `codex.cmd`/`codex.ps1` shims are on `PATH`; it does not launch those shims through a shell. Native `codex.exe` on `PATH` also works. For a nonstandard installation, set `CODEX_GUARD_CODEX_PATH` to the full native executable path (on Linux, to the `codex` binary path). It uses the documented stdio App Server protocol. The implementation was checked against `codex-cli 0.159.0` and its generated v2 JSON schema.
 
 ## Build and run
 
@@ -20,7 +20,9 @@ cargo run --
 
 The release executable is `codex-guard` (`codex-guard.exe` on Windows). You may define your own `cg` shell alias. No Codex task is started by build commands.
 
-`codex-guard [OPTIONS] [PROMPT...]` opens the TUI. With no prompt, it starts in READY: the App Server is initialized and account limits are shown, but no thread or turn is created until you type a prompt and press Enter. A CLI prompt is an optional shortcut that starts a turn in the same TUI. For example: `codex-guard`, `codex-guard -p conservative`, `codex-guard -c 5`, `codex-guard "Fix the backend issue"`, or `codex-guard -p conservative "Review this"`.
+`codex-guard [OPTIONS] [PROMPT...]` opens the TUI. With no prompt, it starts in READY: the App Server is initialized and account limits are shown, but no thread or turn is created until you type a prompt and submit with Ctrl+D or F2. A CLI prompt is an optional shortcut that starts a turn in the same TUI. For example: `codex-guard`, `codex-guard -p conservative`, `codex-guard -c 5`, `codex-guard "Fix the backend issue"`, or `codex-guard -p conservative "Review this"`.
+
+The input is a multiline `tui-textarea` editor. **Enter inserts a newline; Ctrl+D submits** the prompt or command. **F2** is a submit alternative for terminals that do not report Ctrl+D reliably. Cursor keys, Home/End, Backspace and Delete edit at the cursor, and long prompts scroll inside the input pane, which grows up to roughly 40% of terminal height. Bracketed paste inserts the entire clipboard text, including newlines, without submitting it. Some Windows terminals/Crossterm combinations deliver paste as ordinary key events instead; Enter still only inserts a newline in that case, so paste cannot start a task. The real terminal cursor follows the editor. Page Up/Down scroll the agent answer.
 
 ## Configuration
 
@@ -29,6 +31,9 @@ The release executable is `codex-guard` (`codex-guard.exe` on Windows). You may 
 ```toml
 default_profile = "default"
 default_mode = "unattended"
+
+[codex]
+mode = "inherit" # or "yolo"; profiles can override this
 
 [profiles.default.runtime]
 max = "4h"
@@ -74,10 +79,12 @@ finalize_at = 0.60
 urgent_finalize_at = 0.85
 ```
 
-`codex-guard config show` prints the effective profile. `codex-guard profiles` lists configured profiles. `-p`, `-c`/`--credits`, `-t`/`--time`, and `--attended` override one execution. The default mode is unattended. Both session permission overrides are omitted by default, so the App Server inherits the user's Codex settings. `--attended` is still partial: it changes the displayed mode and does not provide interactive approval handling. Hard financial limits apply in either mode.
+`codex-guard config show` prints the effective profile. `codex-guard profiles` lists configured profiles. `-p`, `-c`/`--credits`, `-t`/`--time`, `--attended`, and `--yolo` override one execution. The default mode is unattended. `codex.mode = "inherit"` (the default) does not force permission overrides; explicit `[session]` overrides still work. `codex.mode = "yolo"` or `--yolo` launches the owned binary with `--yolo` and sets the App Server thread and turn to no approvals and danger-full-access sandbox policy. The App Server uses `danger-full-access` for `thread/start.sandbox` and `dangerFullAccess` for `turn/start.sandboxPolicy.type`; these protocol fields have different enum spellings. It deliberately disables Codex sandboxing and approvals; it does **not** disable Guard quota monitoring, steering, burn-rate checks, paid-credit budget, hard stop, or process supervision. No PowerShell alias or function is consulted. For example: `codex-guard`, `codex-guard --yolo`, `codex-guard -c 5 --yolo`. The TUI shows the selected Codex mode. `--attended` is still partial: it changes the displayed mode and does not provide interactive approval handling. Hard financial limits apply in either mode.
 
-Commands in the TUI: `/help`, `/status`, `/logs`, `/steer TEXT`, `/budget NUMBER`, `/profile`, `/interrupt`, `/kill`, `/quit`. Interrupt requires `y`; kill requires typing `kill`; quit with an active turn requires typing `quit` and interrupts the turn. Agent messages appear in their own pane; Page Up and Page Down scroll the full message. The final answer stays in the TUI; exiting prints a session summary.
+Commands in the TUI: `/help`, `/status`, `/logs`, `/steer TEXT`, `/budget NUMBER`, `/profile`, `/clear`, `/interrupt`, `/kill`, `/quit`. Slash commands are interpreted only on explicit submit (Ctrl+D or F2), not while pasting or editing. Interrupt requires `y`; kill requires typing `kill`; quit with an active turn requires typing `quit` and interrupts the turn. Agent messages appear in their own pane; Page Up and Page Down scroll the full message. The final answer stays in the TUI; exiting prints a session summary.
 Normal text in READY or COMPLETED starts a turn. A follow-up reuses the existing thread; normal text while a turn is active is rejected, so steering requires `/steer TEXT`. The final agent message remains in the TUI after completion, and another prompt can start a follow-up. `/interrupt` without an active turn reports that no turn exists; `/quit` without a turn closes normally. `/budget` without a value shows the session budget.
+
+`/clear` abandons the current thread/context and clears the displayed agent message. The next prompt creates a new thread; it does not erase backend history or the JSONL log. During a turn, type `clear` at the confirmation prompt: Guard interrupts the turn using its normal escalation, then clears the thread only after completion. The App Server stays alive if interruption completes normally. **The paid-credit budget, spend ledger, balance baseline, burn-rate history, and session runtime remain unchanged across `/clear`.** Unlike `/quit`, `/clear` starts a fresh conversation within the same financially bounded Guard session.
 
 ## Architecture and safety boundaries
 
@@ -86,6 +93,7 @@ Normal text in READY or COMPLETED starts a turn. A follow-up reuses the existing
 - `src/policy.rs`: task ledger, quota and credit state, one-shot steering, burn-rate window.
 - `src/supervisor/`: Unix session/process group with signals; Windows Job Object with `KILL_ON_JOB_CLOSE`, plus console Ctrl+Break for a graceful attempt.
 - `src/tui.rs`: small ratatui interface and slash command bar.
+- Session-start JSONL includes cwd, inherited PATH, selected Codex mode, resolved executable and App Server arguments for environment diagnosis. It does not modify PATH or search for Python.
 - `src/logging.rs`: one JSONL event log per run, including a final summary. `codex-guard` prints the path on exit.
 
 The Guard records the initial credit balance, sums **positive decreases** on later samples, and retains that sum across turns, quota resets, and balance top-ups. The hard paid-credit budget is for the entire Guard session, not each turn. READY uses normal polling and refreshes the baseline; a fresh `account/rateLimits/read` is required before every `turn/start`. Decreases on the same account while idle are conservatively counted, including late charges from a prior turn; top-ups and idle account switches do not erase cumulative spend. A reported `hasCredits=false`, `unlimited=false`, and null balance is treated as a finite zero. If credits are available but the balance is unknown, the next turn cannot start. Unlimited balances remain unsupported because a balance-decrease budget cannot be enforced. A failed rate-limit read interrupts immediately while paid or near a threshold. With ample included quota, up to `max_consecutive_failures` failures are retried at `retry_interval`; then the turn is interrupted. The credit balance is account-level, so concurrent Codex use on the same account can be counted against this session. Credit charges between samples can exceed a threshold before the Guard observes them. This is a circuit breaker with finite observation latency, not a transactional spending cap.

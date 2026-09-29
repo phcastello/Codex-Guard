@@ -5,15 +5,17 @@ use crate::{
 };
 use anyhow::Result;
 use crossterm::{
-    event::{KeyCode, KeyEvent, KeyEventKind},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
+    style::{Color, Style},
+    text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
@@ -21,10 +23,11 @@ use std::{
     io::{self, Stdout},
     time::Instant,
 };
+use tui_textarea::TextArea;
 
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    input: String,
+    editor: Editor,
     confirm: Option<Confirm>,
     logs_expanded: bool,
     notice: String,
@@ -37,6 +40,25 @@ enum Confirm {
     Interrupt,
     Kill,
     Quit,
+    Clear,
+}
+impl Confirm {
+    fn accepts(self, answer: &str) -> bool {
+        match self {
+            Self::Interrupt => answer.eq_ignore_ascii_case("y"),
+            Self::Kill => answer == "kill",
+            Self::Quit => answer == "quit",
+            Self::Clear => answer == "clear",
+        }
+    }
+    fn command(self) -> &'static str {
+        match self {
+            Self::Interrupt => "/interrupt-confirmed",
+            Self::Kill => "/kill-confirmed",
+            Self::Quit => "/quit-confirmed",
+            Self::Clear => "/clear-confirmed",
+        }
+    }
 }
 
 fn confirmation_for(command: &str, active_turn: bool) -> Option<Confirm> {
@@ -44,18 +66,90 @@ fn confirmation_for(command: &str, active_turn: bool) -> Option<Confirm> {
         "/interrupt" if active_turn => Some(Confirm::Interrupt),
         "/kill" => Some(Confirm::Kill),
         "/quit" if active_turn => Some(Confirm::Quit),
+        "/clear" if active_turn => Some(Confirm::Clear),
         _ => None,
     }
+}
+
+struct Editor {
+    area: TextArea<'static>,
+}
+impl Editor {
+    fn new() -> Self {
+        let mut area = TextArea::default();
+        area.set_cursor_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+        area.set_cursor_line_style(Style::default());
+        Self { area }
+    }
+    fn text(&self) -> String {
+        self.area.lines().join("\n")
+    }
+    fn replace(&mut self, text: &str) {
+        *self = Self::new();
+        self.area.insert_str(text);
+    }
+    fn clear(&mut self) {
+        *self = Self::new();
+    }
+    fn handle(&mut self, event: Event) -> Option<String> {
+        match event {
+            Event::Paste(text) => {
+                self.area
+                    .insert_str(text.replace("\r\n", "\n").replace('\r', "\n"));
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::F(2) | KeyCode::Char('d' | 'D')
+                    if key.code == KeyCode::F(2)
+                        || key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let text = self.text();
+                    self.clear();
+                    return Some(text);
+                }
+                // Crossterm's legacy Windows reader can expose a paste as ordinary
+                // key events. An unmodified Enter can therefore never safely
+                // submit: every Enter, including pasted CR/LF, is a newline.
+                KeyCode::Enter | KeyCode::Char('\n' | '\r') => self.area.insert_newline(),
+                _ => {
+                    self.area.input(key);
+                }
+            },
+            _ => {}
+        }
+        None
+    }
+}
+
+fn input_height(lines: usize, height: u16) -> u16 {
+    if height < 3 {
+        return height;
+    }
+    let ceiling = ((height as u32 * 40) / 100).max(3) as u16;
+    u16::try_from(lines)
+        .unwrap_or(u16::MAX)
+        .saturating_add(3)
+        .clamp(3, ceiling.min(height))
 }
 
 impl Tui {
     pub fn new() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+        let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             terminal,
-            input: String::new(),
+            editor: Editor::new(),
             confirm: None,
             logs_expanded: false,
             notice: String::new(),
@@ -73,64 +167,60 @@ impl Tui {
         self.message_scroll = 0;
     }
     pub fn turn_completed(&mut self) {
-        self.input.clear();
         self.confirm = None;
     }
-    pub fn handle_key(&mut self, key: KeyEvent, active_turn: bool) -> Option<String> {
-        if key.kind != KeyEventKind::Press {
-            return None;
-        }
-        match key.code {
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
-                self.input.push(c)
-            }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Esc => {
-                self.input.clear();
-                self.confirm = None;
-            }
-            KeyCode::PageDown => {
+    pub fn clear_thread(&mut self) {
+        self.agent_text.clear();
+        self.agent_is_final = false;
+        self.message_scroll = 0;
+        self.confirm = None;
+        self.notice("Thread cleared. Financial session budget is unchanged.");
+    }
+    pub fn restore_input(&mut self, text: &str) {
+        self.editor.replace(text);
+    }
+    pub fn handle_event(&mut self, event: Event, active_turn: bool) -> Option<String> {
+        match &event {
+            Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::PageDown => {
                 self.message_scroll = self.message_scroll.saturating_add(5);
+                return None;
             }
-            KeyCode::PageUp => {
+            Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::PageUp => {
                 self.message_scroll = self.message_scroll.saturating_sub(5);
+                return None;
             }
-            KeyCode::Enter => {
-                let entered = std::mem::take(&mut self.input);
-                if let Some(confirm) = self.confirm.take() {
-                    let accepted = match confirm {
-                        Confirm::Interrupt => entered.eq_ignore_ascii_case("y"),
-                        Confirm::Kill => entered == "kill",
-                        Confirm::Quit => entered == "quit",
-                    };
-                    if accepted {
-                        return Some(
-                            match confirm {
-                                Confirm::Interrupt => "/interrupt-confirmed",
-                                Confirm::Kill => "/kill-confirmed",
-                                Confirm::Quit => "/quit-confirmed",
-                            }
-                            .into(),
-                        );
-                    }
-                    self.notice = "Cancelled".into();
-                    return None;
-                }
-                if let Some(confirm) = confirmation_for(&entered, active_turn) {
-                    self.confirm = Some(confirm);
-                } else if entered == "/logs" {
-                    self.logs_expanded = !self.logs_expanded;
-                } else if !entered.is_empty() {
-                    return Some(entered);
-                }
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press
+                    && key.code == KeyCode::Esc
+                    && self.confirm.is_some() =>
+            {
+                self.confirm = None;
+                self.editor.clear();
+                self.notice("Cancelled");
+                return None;
             }
             _ => {}
+        }
+        if let Some(entered) = self.editor.handle(event) {
+            if let Some(confirm) = self.confirm.take() {
+                if confirm.accepts(&entered) {
+                    return Some(confirm.command().into());
+                }
+                self.notice = "Cancelled".into();
+                return None;
+            }
+            if let Some(confirm) = confirmation_for(entered.trim(), active_turn) {
+                self.confirm = Some(confirm);
+            } else if entered.trim() == "/logs" {
+                self.logs_expanded = !self.logs_expanded;
+            } else if matches!(
+                entered.trim(),
+                "/interrupt-confirmed" | "/kill-confirmed" | "/quit-confirmed" | "/clear-confirmed"
+            ) {
+                self.notice("Use the confirmation prompt for that action.");
+            } else if !entered.trim().is_empty() {
+                return Some(entered);
+            }
         }
         None
     }
@@ -140,6 +230,7 @@ impl Tui {
         lifecycle: &str,
         profile: &str,
         mode: &str,
+        codex_mode: crate::config::CodexMode,
         started: Instant,
         logger: &Logger,
         thread_usage: Option<&ThreadUsage>,
@@ -153,12 +244,14 @@ impl Tui {
                 "Kill the Codex process and all child processes? Type \"kill\" to confirm:"
             }
             Some(Confirm::Quit) => "Quit and interrupt the active task? Type \"quit\" to confirm:",
-            None => ">",
+            Some(Confirm::Clear) => {
+                "Clear thread and interrupt the active task? Type \"clear\" to confirm:"
+            }
+            None => " Prompt / command · Enter newline · Ctrl+D or F2 send ",
         };
-        let input = self.input.clone();
         let notice = self.notice.clone();
         let agent_text = if self.agent_text.is_empty() {
-            "No active task. Enter a prompt below to start one.".to_owned()
+            "No active task. Type a prompt below; Ctrl+D or F2 sends it.".to_owned()
         } else {
             self.agent_text.clone()
         };
@@ -181,19 +274,42 @@ impl Tui {
             lifecycle,
             profile,
             mode,
+            codex_mode,
             started,
             thread_usage,
             tools_done,
             tools_running,
         );
+        let editor = &mut self.editor.area;
         self.terminal.draw(|frame| {
+            let height = frame.area().height;
+            let input_rows = input_height(editor.lines().len(), height);
+            let logs_rows = if height >= 30 {
+                if self.logs_expanded {
+                    7
+                } else {
+                    3
+                }
+            } else {
+                0
+            };
+            let status_target = if height >= 28 {
+                14
+            } else if height >= 18 {
+                8
+            } else {
+                4
+            };
+            let status_rows = status_target
+                .min(height.saturating_sub(input_rows).saturating_sub(3))
+                .max(1);
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(13),
-                    Constraint::Min(5),
-                    Constraint::Length(if self.logs_expanded { 7 } else { 3 }),
-                    Constraint::Length(4),
+                    Constraint::Length(status_rows),
+                    Constraint::Min(1),
+                    Constraint::Length(logs_rows),
+                    Constraint::Length(input_rows),
                 ])
                 .split(frame.area());
             let title = format!(" Codex Guard · {} · {} ", profile, mode);
@@ -215,26 +331,43 @@ impl Tui {
                     .scroll((message_scroll, 0)),
                 vertical[1],
             );
-            frame.render_widget(
-                Paragraph::new(rows.join("\n"))
-                    .block(Block::default().title(log_title).borders(Borders::ALL))
-                    .wrap(Wrap { trim: true }),
-                vertical[2],
+            if logs_rows > 0 {
+                frame.render_widget(
+                    Paragraph::new(rows.join("\n"))
+                        .block(Block::default().title(log_title).borders(Borders::ALL))
+                        .wrap(Wrap { trim: true }),
+                    vertical[2],
+                );
+            }
+            let input_rect = ratatui::layout::Rect::new(
+                vertical[3].x,
+                vertical[3].y,
+                vertical[3].width,
+                vertical[3].height.saturating_sub(1),
             );
-            let command = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        prompt,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(" {input}")),
-                ]),
-                Line::from(notice),
-            ])
-            .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(command, vertical[3]);
+            editor.set_block(Block::default().title(prompt).borders(Borders::ALL));
+            frame.render_widget(&*editor, input_rect);
+            let notice_rect = ratatui::layout::Rect::new(
+                vertical[3].x,
+                vertical[3].bottom().saturating_sub(1),
+                vertical[3].width,
+                1,
+            );
+            frame.render_widget(Paragraph::new(notice), notice_rect);
+            let inner = Block::default().borders(Borders::ALL).inner(input_rect);
+            // The editor owns viewport scrolling and Unicode cell widths.
+            for y in inner.y..inner.bottom() {
+                for x in inner.x..inner.right() {
+                    if frame
+                        .buffer_mut()
+                        .cell((x, y))
+                        .is_some_and(|cell| cell.style().bg == Some(Color::Yellow))
+                    {
+                        frame.set_cursor_position((x, y));
+                        return;
+                    }
+                }
+            }
         })?;
         Ok(())
     }
@@ -245,6 +378,7 @@ fn status_lines(
     lifecycle: &str,
     profile: &str,
     mode: &str,
+    codex_mode: crate::config::CodexMode,
     started: Instant,
     thread_usage: Option<&ThreadUsage>,
     tools_done: u64,
@@ -310,9 +444,32 @@ fn status_lines(
         })
         .unwrap_or_else(|| "unavailable".into());
     let text = format!("Status       {lifecycle} · {profile} · {mode} · {}s\nPolicy       {}\n5h quota     {primary} · {reset}\nWeekly       {weekly}\nBilling      {billing}\nCredits      {:.2} / {:.2} session budget\nAccount      {:.2}\nThread est.  {usage}\nModel/usage  {breakdown}\nLast steer   {}\nTools seen   {tools_done} completed · {tools_running} running", started.elapsed().as_secs(), policy.phase.label(), policy.spent, policy.profile.credits.max_spend, policy.balance(), policy.last_steer.unwrap_or("—"));
-    text.lines()
+    let mut lines: Vec<_> = text
+        .lines()
         .map(|line| Line::from(line.to_owned()))
-        .collect()
+        .collect();
+    let label = match codex_mode {
+        crate::config::CodexMode::Inherit => "Codex mode   INHERIT",
+        crate::config::CodexMode::Yolo => "Codex mode   YOLO · no sandbox / no approvals",
+    };
+    lines.insert(
+        1,
+        Line::styled(
+            label,
+            if codex_mode == crate::config::CodexMode::Yolo {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            },
+        ),
+    );
+    let credits = lines.remove(6);
+    let billing = lines.remove(5);
+    let quota = lines.remove(3);
+    lines.insert(2, credits);
+    lines.insert(2, billing);
+    lines.insert(2, quota);
+    lines
 }
 fn u_groups_more(usage: Option<&ThreadUsage>) -> bool {
     usage.is_some_and(|u| u.groups.len() > 1)
@@ -320,6 +477,11 @@ fn u_groups_more(usage: Option<&ThreadUsage>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
+    use ratatui::backend::TestBackend;
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
     #[test]
     fn idle_interrupt_and_quit_do_not_request_confirmation() {
         assert_eq!(confirmation_for("/interrupt", false), None);
@@ -330,11 +492,96 @@ mod tests {
         );
         assert_eq!(confirmation_for("/quit", true), Some(Confirm::Quit));
         assert_eq!(confirmation_for("/kill", false), Some(Confirm::Kill));
+        assert_eq!(confirmation_for("/clear", false), None);
+        assert_eq!(confirmation_for("/clear", true), Some(Confirm::Clear));
+        assert!(!Confirm::Clear.accepts("y"));
+        assert!(Confirm::Clear.accepts("clear"));
+        assert_eq!(Confirm::Clear.command(), "/clear-confirmed");
+    }
+    #[test]
+    fn paste_and_enter_edit_text_until_explicit_submit() {
+        let mut editor = Editor::new();
+        assert_eq!(
+            editor.handle(Event::Paste("alpha\r\n\r\nbeta".into())),
+            None
+        );
+        assert_eq!(editor.text(), "alpha\n\nbeta");
+        assert_eq!(editor.handle(key(KeyCode::Enter, KeyModifiers::ALT)), None);
+        editor.handle(Event::Paste("gamma".into()));
+        assert_eq!(editor.handle(key(KeyCode::Enter, KeyModifiers::NONE)), None);
+        editor.handle(Event::Paste("delta".into()));
+        assert_eq!(
+            editor.handle(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some("alpha\n\nbeta\ngamma\ndelta".into())
+        );
+        assert_eq!(editor.text(), "");
+    }
+    #[test]
+    fn unbracketed_multiline_paste_keys_cannot_submit() {
+        let mut editor = Editor::new();
+        for event in [
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::CONTROL), // Seen during Windows paste.
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+        ] {
+            assert_eq!(editor.handle(event), None);
+        }
+        assert_eq!(editor.text(), "a\nb\nc");
+        assert_eq!(
+            editor.handle(key(KeyCode::F(2), KeyModifiers::NONE)),
+            Some("a\nb\nc".into())
+        );
+    }
+    #[test]
+    fn unicode_navigation_and_large_prompt_remain_editable() {
+        let mut editor = Editor::new();
+        editor.handle(Event::Paste(format!("🙂 café\n{}", "x".repeat(600))));
+        for code in [
+            KeyCode::Left,
+            KeyCode::Up,
+            KeyCode::Home,
+            KeyCode::Right,
+            KeyCode::Down,
+            KeyCode::End,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
+            editor.handle(key(code, KeyModifiers::NONE));
+        }
+        assert!(editor.text().starts_with("🙂 café\n"));
+        assert!(editor.text().len() > 500);
+        assert!(input_height(100, 40) <= 16);
+        assert_eq!(input_height(1, 40), 4);
+    }
+    #[test]
+    fn scrolled_editor_renders_a_visible_cursor_cell() {
+        let mut editor = Editor::new();
+        editor.handle(Event::Paste(
+            (0..40)
+                .map(|i| format!("line {i} — 🙂"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                let rect = frame.area();
+                frame.render_widget(&editor.area, rect);
+                assert!(
+                    (rect.y..rect.bottom()).any(|y| (rect.x..rect.right()).any(|x| frame
+                        .buffer_mut()
+                        .cell((x, y))
+                        .is_some_and(|cell| cell.style().bg == Some(Color::Yellow))))
+                );
+            })
+            .unwrap();
     }
 }
 impl Drop for Tui {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
