@@ -130,7 +130,7 @@ fn tool_label(kind: &str, item: &Value) -> String {
                 .get("command")
                 .and_then(Value::as_str)
                 .unwrap_or("command");
-            one_line(command, 110)
+            one_line(command_body(command), 110)
         }
         "fileChange" => {
             let paths = item
@@ -160,6 +160,39 @@ fn tool_label(kind: &str, item: &Value) -> String {
         }
         other => format!("Used {}", one_line(other, 80)),
     }
+}
+
+// Hide the shell wrapper in the transcript without changing the executed command.
+fn command_body(command: &str) -> &str {
+    let trimmed = command.trim();
+    let (executable, rest) = if let Some(quoted) = trimmed.strip_prefix('"') {
+        let Some(end) = quoted.find('"') else {
+            return command;
+        };
+        (&quoted[..end], &quoted[end + 1..])
+    } else {
+        let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        (&trimmed[..end], &trimmed[end..])
+    };
+    let name = executable.rsplit(['\\', '/']).next().unwrap_or(executable);
+    if !["powershell.exe", "powershell", "pwsh.exe", "pwsh"]
+        .iter()
+        .any(|shell| name.eq_ignore_ascii_case(shell))
+    {
+        return command;
+    }
+    let rest = rest.trim_start();
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    if !rest[..end].eq_ignore_ascii_case("-Command") {
+        return command;
+    }
+    let body = rest[end..].trim();
+    if body.is_empty() {
+        return command;
+    }
+    body.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(body)
 }
 
 fn one_line(s: &str, max: usize) -> String {
@@ -231,6 +264,34 @@ mod tests {
         assert!(text.contains("Used futureThing"));
         assert!(!text.contains("secret"));
     }
+    #[test]
+    fn powershell_wrapper_is_hidden_in_started_and_completed_commands() {
+        let mut t = Transcript::default();
+        let command = json!({
+            "id": "ps", "type": "commandExecution", "exitCode": 0,
+            "command": r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command "Get-Content \"file.txt\"""#
+        });
+        t.tool("item/started", &command);
+        t.tool("item/completed", &command);
+        assert_eq!(t.pending[0].text, r#"• Running Get-Content \"file.txt\""#);
+        assert_eq!(t.pending[1].text, r#"✓ Get-Content \"file.txt\" passed"#);
+    }
+
+    #[test]
+    fn shell_display_preserves_other_commands_and_arguments() {
+        assert_eq!(command_body("pwsh -command \"cargo check\""), "cargo check");
+        assert_eq!(command_body("powershell.exe -Command Get-Date"), "Get-Date");
+        for command in [
+            "cargo check",
+            "cmd.exe /C echo hello",
+            "powershell.exe -File script.ps1",
+            "powershell.exe -Command",
+            "powershell.exe -CommandWithArgs hello",
+        ] {
+            assert_eq!(command_body(command), command);
+        }
+    }
+
     #[test]
     fn failed_command_shows_bounded_output() {
         let mut t = Transcript::default();
