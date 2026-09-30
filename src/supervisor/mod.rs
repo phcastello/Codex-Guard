@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 #[cfg(unix)]
@@ -20,21 +20,27 @@ pub fn app_server_arguments() -> Vec<&'static str> {
     vec!["--yolo", "app-server", "--stdio"]
 }
 
+fn app_server_command(executable: &Path, session_workspace: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .args(app_server_arguments())
+        .current_dir(session_workspace)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(false);
+    command
+}
+
 impl ProcessSupervisor {
-    pub fn spawn() -> Result<(Self, ChildStdin, ChildStdout, ChildStderr)> {
+    pub fn spawn(session_workspace: &Path) -> Result<(Self, ChildStdin, ChildStdout, ChildStderr)> {
         #[cfg(windows)]
         let executable = windows::find_codex_executable()?;
         #[cfg(unix)]
         let executable =
             std::env::var_os("CODEX_GUARD_CODEX_PATH").unwrap_or_else(|| "codex".into());
-        let mut command = Command::new(&executable);
+        let mut command = app_server_command(Path::new(&executable), session_workspace);
         let arguments = app_server_arguments();
-        command
-            .args(&arguments)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(false);
         #[cfg(unix)]
         unix::configure(&mut command);
         #[cfg(windows)]
@@ -113,6 +119,32 @@ impl Drop for ProcessSupervisor {
         #[cfg(unix)]
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = unix::signal_group(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn app_server_uses_user_workspace_regardless_of_install_directory() {
+        for (executable, cwd) in [
+            (
+                r"C:\Users\Pedro\AppData\Local\CodexGuard\bin\codex-guard.exe",
+                r"C:\Projects\Aegis",
+            ),
+            (
+                "/home/pedro/.local/bin/codex-guard",
+                "/home/pedro/Projects/Aegis",
+            ),
+        ] {
+            // Inspect the actual spawn builder without starting any child.
+            let command = app_server_command(Path::new(executable), Path::new(cwd));
+            assert_eq!(command.as_std().get_current_dir(), Some(Path::new(cwd)));
+            assert_eq!(
+                command.as_std().get_args().collect::<Vec<_>>(),
+                app_server_arguments()
+            );
         }
     }
 }

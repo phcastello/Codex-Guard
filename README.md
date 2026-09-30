@@ -2,25 +2,79 @@
 
 Codex Guard is a small interactive terminal frontend for a Codex App Server process that it starts and owns. It watches the included quota and the account credit balance, steers a running turn near thresholds, and interrupts when the session's paid-credit budget is reached.
 
-This is an MVP. It requires a recent Codex CLI installation authenticated with ChatGPT and a terminal supporting crossterm. On Windows, the Guard finds the native `codex.exe` inside a standard global npm installation even when only npm's `codex.cmd`/`codex.ps1` shims are on `PATH`; it does not launch those shims through a shell. Native `codex.exe` on `PATH` also works. For a nonstandard installation, set `CODEX_GUARD_CODEX_PATH` to the full native executable path (on Linux, to the `codex` binary path). It uses the documented stdio App Server protocol.
+## Download
 
-Codex Guard always runs Codex in **YOLO mode**, with no sandbox and no approvals. Guard controls financial limits and process supervision for long unattended tasks. Permission handling is fixed at the process, thread and turn levels; financial protection remains active.
+### Windows x86_64
 
-## Build and run
+[⬇ Download Codex Guard for Windows](https://github.com/phcastello/Codex-Guard/releases/latest/download/codex-guard-windows-x86_64.exe)
 
-```sh
-cargo build --release
-cargo run --
-```
+### Linux x86_64
 
-On Windows PowerShell:
+[⬇ Download Codex Guard for Linux](https://github.com/phcastello/Codex-Guard/releases/latest/download/codex-guard-linux-x86_64)
+
+Native executables for each platform, from the latest release. No repository clone, Rust, `cargo`, administrator privileges or platform flag is needed. Download links become available when the first release is published.
+
+[SHA-256 checksums](https://github.com/phcastello/Codex-Guard/releases/latest/download/SHA256SUMS.txt) are included with every release. The Guard executable is standalone; **Codex CLI is a separate requirement and is not bundled**.
+
+## First run
+
+Requirements: a recent OpenAI Codex CLI installed and authenticated with your Codex/ChatGPT account, and an interactive terminal.
+
+### Windows
+
+1. Download `codex-guard-windows-x86_64.exe` and execute it once, preferably from a terminal in your project directory.
+2. Guard installs itself to `%LOCALAPPDATA%\CodexGuard\bin`, adds that directory to your **user PATH**, and continues running immediately. No administrator privileges are needed.
+3. Open a new terminal, go to any project, and run either command:
 
 ```powershell
-cargo build --release
-cargo run --
+cd C:\Projects\my-app
+cg
+# codex-guard works too
 ```
 
-The release executable is `codex-guard` (`codex-guard.exe` on Windows). You may define your own `cg` shell alias. No Codex task is started by build commands.
+The current terminal does not receive the persistent PATH change; the first execution supplies it to the installed process itself. These binaries are not signed, so Windows SmartScreen may show a warning for a downloaded executable.
+
+### Linux
+
+1. Download `codex-guard-linux-x86_64`. Browser downloads commonly need the executable bit set.
+2. From a terminal, make it executable and run it once (adjust the downloaded file's path if needed):
+
+```bash
+chmod +x ./codex-guard-linux-x86_64
+./codex-guard-linux-x86_64
+```
+
+3. Guard installs to `~/.local/bin/codex-guard`, creates `~/.local/bin/cg -> codex-guard`, and continues running immediately.
+4. Open a new terminal and run:
+
+```bash
+cd ~/Projects/my-app
+cg
+# codex-guard works too
+```
+
+If `~/.local/bin` is already on PATH, no shell configuration is changed. Otherwise Guard uses `$SHELL` to append an idempotent PATH entry to Bash's `~/.bashrc`, Zsh's `~/.zshrc` (or `$ZDOTDIR/.zshrc`), or Fish's `~/.config/fish/config.fish` (respecting `$XDG_CONFIG_HOME`). Fish uses `fish_add_path --path`, rather than Bash syntax. An unknown shell or a configuration error produces a clear message and still allows the current execution to continue.
+
+### Workspace and updates
+
+**Codex Guard always uses the directory from which it was launched as the Codex workspace.** In both project examples above, that project directory is the workspace, regardless of where Guard is installed. To use a project on the first downloaded execution, change to the project and invoke the download by its absolute path. Launching via a file manager uses the cwd supplied by that file manager.
+
+The cwd is captured before installation and preserved through reexecution. Guard explicitly sets the App Server process cwd and sends the same workspace in `thread/start.cwd` and `turn/start.cwd`. Installation paths never select a workspace.
+
+To update manually, download and run a newer release executable. It replaces the canonical installation and continues with the new copy, preserving cwd and arguments. On Windows, close running Guard sessions before updating so their executables are not locked. Running `codex-guard` or `cg` from its installed location does not recopy the binary. An unrelated existing `~/.local/bin/cg` is preserved and reported; binaries or aliases elsewhere on PATH are never removed. If another `cg` takes precedence in PATH, use `codex-guard`.
+
+`--help`, `--version`, `config path`, `config show`, and `profiles` are inspection commands: they do not self-install or start an App Server. A copy or PATH error is reported without deleting the download; Guard continues with the downloaded or installed executable when possible. Global commands may require fixing the reported installation issue.
+
+```text
+codex-guard --version
+codex-guard 0.1.0
+```
+
+## How it works
+
+On Windows, the Guard finds the native `codex.exe` inside a standard global npm installation even when only npm's `codex.cmd`/`codex.ps1` shims are on `PATH`; it does not launch those shims through a shell. Native `codex.exe` on `PATH` also works. For a nonstandard installation, set `CODEX_GUARD_CODEX_PATH` to the full native executable path (on Linux, to the `codex` binary path). It uses the [documented stdio App Server protocol](https://learn.chatgpt.com/docs/app-server).
+
+Codex Guard always runs Codex in **YOLO mode**, with no sandbox and no approvals. Guard controls financial limits and process supervision for long unattended tasks. Permission handling is fixed at the process, thread and turn levels; financial protection remains active.
 
 `codex-guard [OPTIONS] [PROMPT...]` opens an inline TUI. With no prompt, it starts in READY: the App Server is initialized, but no thread or turn is created until you type a prompt and submit with Ctrl+D or F2. A CLI prompt is an optional shortcut that starts a turn in the same TUI. For example: `codex-guard`, `codex-guard -p conservative`, `codex-guard -c 5`, `codex-guard "Fix the backend issue"`, or `codex-guard -p conservative "Review this"`.
 
@@ -92,10 +146,11 @@ Normal text in READY or COMPLETED starts a turn. A follow-up reuses the existing
 - `src/config.rs`: persistent profile merge and input validation.
 - `src/policy.rs`: task ledger, quota and credit state, one-shot steering, burn-rate window.
 - `src/supervisor/`: Unix session/process group with signals; Windows Job Object with `KILL_ON_JOB_CLOSE`, plus console Ctrl+Break for a graceful attempt.
+- `src/install/`: immutable process context, canonical installation detection, staged binary replacement, platform PATH setup, `cg`, and reexecution. Windows uses only Registry APIs for `HKCU\Environment\Path` and broadcasts `WM_SETTINGCHANGE`; existing entries and string types are preserved. Linux writes shell configuration only when the installation directory is absent from the inherited PATH. Unix replaces the process with `exec`; Windows waits for the installed child to keep the terminal attached and propagate its exit status.
 - `src/app_server/models.rs`: typed model catalog, pagination and model/effort selection defaults.
 - `src/commands.rs`: shared command names, help, descriptions and availability.
 - `src/tui.rs` and `src/tui/`: anchored inline output, bottom pane, composer, command popup, model picker, transcript and status presentation.
-- Session-start JSONL includes cwd, inherited PATH, fixed YOLO permissions, resolved executable and App Server arguments for environment diagnosis. Catalog reads and model selections are logged. It does not modify PATH or search for Python.
+- Session-start JSONL includes `workspace`, `executable_path` (Guard), `installed_path`, `version`, `platform`, cwd, inherited PATH, fixed YOLO permissions, resolved Codex executable and App Server arguments for environment diagnosis. Catalog reads and model selections are logged.
 - `src/logging.rs`: one JSONL event log per run, including a final summary. `codex-guard` prints the path on exit.
 
 The Guard records the initial credit balance, sums **positive decreases** on later samples, and retains that sum across turns, quota resets, and balance top-ups. The hard paid-credit budget is for the entire Guard session, not each turn. READY uses normal polling and refreshes the baseline; a fresh `account/rateLimits/read` is required before every `turn/start`. Decreases on the same account while idle are conservatively counted, including late charges from a prior turn; top-ups and idle account switches do not erase cumulative spend. A reported `hasCredits=false`, `unlimited=false`, and null balance is treated as a finite zero. If credits are available but the balance is unknown, the next turn cannot start. Unlimited balances remain unsupported because a balance-decrease budget cannot be enforced. A failed rate-limit read interrupts immediately while paid or near a threshold. With ample included quota, up to `max_consecutive_failures` failures are retried at `retry_interval`; then the turn is interrupted. The credit balance is account-level, so concurrent Codex use on the same account can be counted against this session. Credit charges between samples can exceed a threshold before the Guard observes them. This is a circuit breaker with finite observation latency, not a transactional spending cap.
@@ -108,22 +163,43 @@ The shutdown sequence sends the `turn/interrupt` request without awaiting its re
 
 The TUI intentionally does not recreate all Codex UI features. Interactive user-input requests from the server are not yet supported: the Guard rejects unsupported requests and interrupts the turn to avoid repeated failed attempts. The App Server's stderr is summarized in the event log. No external web dashboard, cloud telemetry, or semantic loop detection is included.
 
+## Building from source
+
+Contributors need Rust. Build and test commands do not install Guard or start Codex:
+
+```sh
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo build --release
+```
+
+Normal interactive execution of a built binary also self-installs. Inspection commands such as `cargo run -- --version` do not.
+
+The tag-only [release workflow](.github/workflows/release.yml) requires `v` plus the `Cargo.toml` version (for example, `v0.1.0`). It runs Windows and Linux builds independently, tests all host targets and the Linux musl target, and publishes only after both builds pass. Windows uses `windows-latest` with `x86_64-pc-windows-msvc` and a statically linked CRT; Linux uses `ubuntu-latest` with `x86_64-unknown-linux-musl` and checks that no dynamic loader or shared libraries are required. The current dependency graph does not need a glibc fallback. The workflow installs `musl-tools` on its Linux runner.
+
+Assets always have stable names: `codex-guard-windows-x86_64.exe`, `codex-guard-linux-x86_64`, and `SHA256SUMS.txt`. The publishing job computes SHA-256 over both final binaries, uploads to a draft, downloads and verifies all assets, then publishes the complete release. An upload or verification failure leaves an unpublished draft for a retry. A normal push to `main` does not trigger a release. GitHub/browser downloads do not reliably preserve Linux executable permissions; use `chmod +x` as shown above. No remote auto-update or package-manager installer is included.
+
 ## Manual validation (not run during implementation)
+
+Before publishing, use disposable Windows/Linux user accounts to check first installation, a second launch without installation, a downloaded update, PATH behavior in newly opened terminals, and `cg` name conflicts. Cover Bash, Zsh, Fish and an unknown shell; existing PATH entries, spaces/non-ASCII in paths, unwritable destinations and Windows executables locked by a running session. Confirm that original arguments and the project cwd survive reexecution. On Windows, also check a browser download/SmartScreen and launches from a file manager. On Linux, exercise the musl binary on multiple distributions.
+
+Installation tests use pure functions or temporary mock homes and never write the real Registry or shell configuration. Process builder tests inspect cwd and arguments without launching Codex.
+
+For optional interactive validation after installation:
 
 On Linux:
 
 ```sh
-cargo build --release --target x86_64-unknown-linux-gnu
-cargo test --all-targets
-cargo run -- "Summarize this repository"
+cd ~/Projects/my-app
+cg "Summarize this repository"
 ```
 
 On Windows (PowerShell):
 
 ```powershell
-cargo build --release --target x86_64-pc-windows-msvc
-cargo test --all-targets
-cargo run -- "Summarize this repository"
+cd C:\Projects\my-app
+cg "Summarize this repository"
 ```
 
 Before using paid credits, validate the balance fields shown by your installed Codex version, then manually exercise `/steer`, `/interrupt`, `/kill`, quota reset handling, and a deliberately low credit budget with a controlled short task. Do not use a long or expensive task for initial validation.

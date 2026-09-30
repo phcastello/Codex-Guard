@@ -13,6 +13,52 @@ pub struct Cli {
     pub run: RunArgs,
 }
 
+impl Cli {
+    pub fn requires_install(&self) -> bool {
+        self.command.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inspection_skips_installation_and_normal_execution_installs() {
+        for arguments in [
+            vec!["config", "path"],
+            vec!["config", "show"],
+            vec!["profiles"],
+        ] {
+            assert!(
+                !Cli::try_parse_from(std::iter::once("codex-guard").chain(arguments))
+                    .unwrap()
+                    .requires_install()
+            );
+        }
+        for argument in ["--help", "--version"] {
+            let error = Cli::try_parse_from(["codex-guard", argument]).unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ));
+        }
+        assert!(Cli::try_parse_from(["codex-guard"])
+            .unwrap()
+            .requires_install());
+        assert!(Cli::try_parse_from([
+            "codex-guard",
+            "-p",
+            "conservative",
+            "-c",
+            "5",
+            "corrija isso"
+        ])
+        .unwrap()
+        .requires_install());
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Config {

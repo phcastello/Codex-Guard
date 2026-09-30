@@ -2,6 +2,7 @@ mod app_server;
 mod cli;
 mod commands;
 mod config;
+mod install;
 mod logging;
 mod policy;
 mod supervisor;
@@ -14,11 +15,13 @@ use cli::{Cli, Command, ConfigCommand};
 use config::Loaded;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
+use install::{InstallPaths, ProcessContext};
 use logging::Logger;
 use policy::{Action, Policy};
 use serde_json::{json, Value};
 use std::{
     future::Future,
+    path::Path,
     time::{Duration, Instant},
 };
 use supervisor::ProcessSupervisor;
@@ -30,9 +33,28 @@ use tokio::{
 };
 use tui::{StatusContext, Tui};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+fn main() -> Result<()> {
+    let context = ProcessContext::capture()?;
+    let cli = Cli::parse_from(
+        std::iter::once(context.executable().as_os_str())
+            .chain(context.arguments().iter().map(|arg| arg.as_os_str())),
+    );
+    let paths = InstallPaths::discover();
+    if cli.requires_install() {
+        if let Err(error) = &paths {
+            eprintln!("Installation directory: {error:#}");
+        }
+        if let Some(status) = install::startup(&context, paths.as_ref().ok())? {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(cli_main(cli, context, paths.ok()))
+}
+
+async fn cli_main(cli: Cli, context: ProcessContext, paths: Option<InstallPaths>) -> Result<()> {
     let loaded = config::load(
         cli.run.profile.as_deref(),
         cli.run.credits,
@@ -68,7 +90,7 @@ async fn main() -> Result<()> {
     }
     let prompt = cli.run.prompt.join(" ");
     let initial_prompt = (!prompt.trim().is_empty()).then_some(prompt);
-    run(loaded, initial_prompt).await
+    run(loaded, initial_prompt, &context, paths.as_ref()).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +142,8 @@ fn classify_input(text: String, state: SessionState) -> UserInput {
     }
 }
 
-fn thread_start_params(cwd: String, selection: Option<&ModelSelection>) -> Value {
+fn thread_start_params(workspace: &Path, selection: Option<&ModelSelection>) -> Value {
+    let cwd = workspace.to_string_lossy();
     let mut params = json!({"cwd":cwd,"serviceName":"codex_guard","approvalPolicy":"never","sandbox":"danger-full-access"});
     if let Some(selection) = selection {
         params["model"] = json!(selection.model);
@@ -128,8 +151,13 @@ fn thread_start_params(cwd: String, selection: Option<&ModelSelection>) -> Value
     params
 }
 
-fn turn_start_params(thread_id: &str, prompt: &str, selection: Option<&ModelSelection>) -> Value {
-    let mut params = json!({"threadId":thread_id,"input":[{"type":"text","text":prompt}],"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}});
+fn turn_start_params(
+    thread_id: &str,
+    prompt: &str,
+    workspace: &Path,
+    selection: Option<&ModelSelection>,
+) -> Value {
+    let mut params = json!({"threadId":thread_id,"cwd":workspace.to_string_lossy(),"input":[{"type":"text","text":prompt}],"approvalPolicy":"never","sandboxPolicy":{"type":"dangerFullAccess"}});
     if let Some(selection) = selection {
         params["model"] = json!(selection.model);
         if let Some(effort) = &selection.effort {
@@ -199,8 +227,14 @@ impl Stop {
     }
 }
 
-async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
-    let (mut process, stdin, stdout, stderr) = ProcessSupervisor::spawn()?;
+async fn run(
+    loaded: Loaded,
+    initial_prompt: Option<String>,
+    context: &ProcessContext,
+    paths: Option<&InstallPaths>,
+) -> Result<()> {
+    let session_workspace = context.workspace();
+    let (mut process, stdin, stdout, stderr) = ProcessSupervisor::spawn(session_workspace)?;
     let (client, mut events, mut activity) = Client::new(stdin, stdout);
     let (stderr_tx, mut stderr_rx) = mpsc::channel::<String>(64);
     tokio::spawn(async move {
@@ -233,7 +267,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
     };
     logger.record(
         "session_start",
-        json!({"profile":loaded.profile_name,"mode":loaded.mode,"permissions":"YOLO","pid":process.id(),"cwd":std::env::current_dir()?.display().to_string(),"executable":process.executable().display().to_string(),"app_server_args":process.arguments(),"path":std::env::var_os("PATH").map(|value|value.to_string_lossy().into_owned())}),
+        json!({"profile":loaded.profile_name,"mode":loaded.mode,"permissions":"YOLO","pid":process.id(),"cwd":session_workspace,"workspace":session_workspace,"executable_path":context.executable(),"installed_path":paths.map(|p| &p.executable),"version":install::VERSION,"platform":install::platform(),"executable":process.executable().display().to_string(),"app_server_args":process.arguments(),"path":std::env::var_os("PATH").map(|value|value.to_string_lossy().into_owned())}),
     );
     logger.record(
         "credit_snapshot",
@@ -300,6 +334,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
         })?;
         if let Err(error) = start_turn(
             &client,
+            session_workspace,
             &mut policy,
             &mut logger,
             &mut ui,
@@ -488,7 +523,7 @@ async fn run(loaded: Loaded, initial_prompt: Option<String>) -> Result<()> {
                             UserInput::Prompt(prompt) => {
                                 ui.user_prompt(&prompt);
                                 ui.draw(&StatusContext { policy: &policy, lifecycle: state.label(), profile: &loaded.profile_name, mode: &loaded.mode, started, usage: thread_usage.as_ref(), tools_done, tools_running })?;
-                                match start_turn(&client, &mut policy, &mut logger, &mut ui, &mut thread, &mut turn, &mut stop, &mut state, &mut turn_started, &mut turns, prompt.clone()).await {
+                                match start_turn(&client, session_workspace, &mut policy, &mut logger, &mut ui, &mut thread, &mut turn, &mut stop, &mut state, &mut turn_started, &mut turns, prompt.clone()).await {
                                     Ok(()) => {
                                         if usage_task.is_none() {
                                             if let Some(thread_id) = thread.as_ref() {
@@ -684,6 +719,7 @@ async fn reconcile_idle(
 #[allow(clippy::too_many_arguments)]
 async fn start_turn(
     client: &Client,
+    session_workspace: &Path,
     policy: &mut Policy,
     logger: &mut Logger,
     ui: &mut Tui,
@@ -702,8 +738,7 @@ async fn start_turn(
     policy.observe_idle(snapshot)?;
     policy.prepare_turn()?;
     if thread.is_none() {
-        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
-        let params = thread_start_params(cwd, selection.as_ref());
+        let params = thread_start_params(session_workspace, selection.as_ref());
         let id = client
             .call("thread/start", Some(params))
             .await?
@@ -718,7 +753,12 @@ async fn start_turn(
     let turn_id = client
         .call(
             "turn/start",
-            Some(turn_start_params(thread_id, &prompt, selection.as_ref())),
+            Some(turn_start_params(
+                thread_id,
+                &prompt,
+                session_workspace,
+                selection.as_ref(),
+            )),
         )
         .await?
         .pointer("/turn/id")
@@ -859,23 +899,24 @@ mod tests {
             display_name: "Model A".into(),
             effort: Some("custom-effort".into()),
         };
-        let thread = thread_start_params("cwd".into(), Some(&selection));
+        let thread = thread_start_params(Path::new("cwd"), Some(&selection));
         assert_eq!(thread["approvalPolicy"], "never");
         assert_eq!(thread["sandbox"], "danger-full-access");
         assert_eq!(thread["model"], "model-a");
-        let turn = turn_start_params("thread", "prompt", Some(&selection));
+        let turn = turn_start_params("thread", "prompt", Path::new("cwd"), Some(&selection));
         assert_eq!(turn["approvalPolicy"], "never");
         assert_eq!(turn["sandboxPolicy"]["type"], "dangerFullAccess");
         assert_eq!(turn["model"], "model-a");
         assert_eq!(turn["effort"], "custom-effort");
         selection.model = "model-b".into();
         selection.effort = Some("different-effort".into());
-        let follow_up = turn_start_params("thread", "follow up", Some(&selection));
+        let follow_up =
+            turn_start_params("thread", "follow up", Path::new("cwd"), Some(&selection));
         assert_eq!(follow_up["threadId"], "thread");
         assert_eq!(follow_up["model"], "model-b");
         assert_eq!(follow_up["effort"], "different-effort");
-        let default_thread = thread_start_params("cwd".into(), None);
-        let default_turn = turn_start_params("thread", "prompt", None);
+        let default_thread = thread_start_params(Path::new("cwd"), None);
+        let default_turn = turn_start_params("thread", "prompt", Path::new("cwd"), None);
         assert!(default_thread.get("model").is_none());
         assert!(default_turn.get("model").is_none());
         assert!(default_turn.get("effort").is_none());
@@ -883,6 +924,19 @@ mod tests {
         assert_eq!(default_turn["approvalPolicy"], "never");
         assert!(Cli::try_parse_from(["codex-guard", "--yolo"]).is_err());
         assert_eq!(toml::to_string(&profile).unwrap(), financial_before);
+    }
+    #[test]
+    fn workspace_is_explicit_in_threads_and_every_turn_on_both_platforms() {
+        for cwd in [r"C:\Projects\Aegis", "/home/pedro/Projects/Aegis"] {
+            let workspace = Path::new(cwd);
+            assert_eq!(thread_start_params(workspace, None)["cwd"], cwd);
+            for prompt in ["first prompt", "follow up after clear"] {
+                assert_eq!(
+                    turn_start_params("thread", prompt, workspace, None)["cwd"],
+                    cwd
+                );
+            }
+        }
     }
     #[test]
     fn extracts_full_agent_text_and_final_phase() {

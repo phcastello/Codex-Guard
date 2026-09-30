@@ -1,0 +1,144 @@
+name: Release native binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require tag to match Cargo version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as source:
+              version = tomllib.load(source)['package']['version']
+          expected = 'v' + version
+          assert os.environ['RELEASE_TAG'] == expected, f'Tag must be {expected}'
+          PY
+
+  build:
+    needs: validate-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: codex-guard-windows-x86_64.exe
+            binary: codex-guard.exe
+            rustflags: '-C target-feature=+crt-static'
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: codex-guard-linux-x86_64
+            binary: codex-guard
+            # musl is static by default; forcing crt-static on host tests would
+            # prevent Linux proc-macro dependencies from compiling.
+            rustflags: ''
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test all targets on host
+        run: cargo test --locked --all-targets
+      - name: Test musl binary on Linux
+        if: runner.os == 'Linux'
+        run: cargo test --locked --all-targets --target x86_64-unknown-linux-musl
+      - name: Build native release
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item -LiteralPath 'target/${{ matrix.target }}/release/${{ matrix.binary }}' -Destination 'dist/${{ matrix.asset }}'
+          & './dist/${{ matrix.asset }}' --version
+          if ($LASTEXITCODE -ne 0) { throw 'Version smoke test failed' }
+      - name: Package and verify static Linux executable
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          install -m 755 'target/${{ matrix.target }}/release/${{ matrix.binary }}' 'dist/${{ matrix.asset }}'
+          program_headers=$(readelf -l 'dist/${{ matrix.asset }}')
+          if grep -q INTERP <<< "$program_headers"; then
+            echo 'Linux release unexpectedly requires a dynamic loader' >&2
+            exit 1
+          fi
+          dynamic_section=$(readelf -d 'dist/${{ matrix.asset }}')
+          if grep -q NEEDED <<< "$dynamic_section"; then
+            echo 'Linux release unexpectedly requires shared libraries' >&2
+            exit 1
+          fi
+          './dist/${{ matrix.asset }}' --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [validate-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: codex-guard-*
+          path: dist
+          merge-multiple: true
+      - name: Require both assets and generate SHA-256
+        working-directory: dist
+        run: |
+          test -s codex-guard-windows-x86_64.exe
+          test -s codex-guard-linux-x86_64
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 2
+          # Artifact transfers do not preserve the executable bit.
+          chmod 755 codex-guard-linux-x86_64
+          sha256sum codex-guard-windows-x86_64.exe codex-guard-linux-x86_64 > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+      - name: Upload to draft, verify downloads, then publish complete release
+        working-directory: dist
+        run: |
+          # A failed upload stays in a draft, never a publicly partial release.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" = true
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+          fi
+          gh release upload "$RELEASE_TAG" codex-guard-windows-x86_64.exe codex-guard-linux-x86_64 SHA256SUMS.txt --clobber
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > actual-assets.txt
+          printf '%s\n' SHA256SUMS.txt codex-guard-linux-x86_64 codex-guard-windows-x86_64.exe | sort > expected-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+          gh release download "$RELEASE_TAG" --dir verified --pattern codex-guard-windows-x86_64.exe --pattern codex-guard-linux-x86_64 --pattern SHA256SUMS.txt
+          (cd verified && sha256sum -c SHA256SUMS.txt)
+          gh release edit "$RELEASE_TAG" --draft=false --latest
