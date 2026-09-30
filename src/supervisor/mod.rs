@@ -1,4 +1,3 @@
-use crate::config::CodexMode;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -17,24 +16,19 @@ pub struct ProcessSupervisor {
     arguments: Vec<&'static str>,
 }
 
-pub fn app_server_arguments(mode: CodexMode) -> Vec<&'static str> {
-    let mut args = Vec::new();
-    if mode == CodexMode::Yolo {
-        args.push("--yolo");
-    }
-    args.extend(["app-server", "--stdio"]);
-    args
+pub fn app_server_arguments() -> Vec<&'static str> {
+    vec!["--yolo", "app-server", "--stdio"]
 }
 
 impl ProcessSupervisor {
-    pub fn spawn(mode: CodexMode) -> Result<(Self, ChildStdin, ChildStdout, ChildStderr)> {
+    pub fn spawn() -> Result<(Self, ChildStdin, ChildStdout, ChildStderr)> {
         #[cfg(windows)]
         let executable = windows::find_codex_executable()?;
         #[cfg(unix)]
         let executable =
             std::env::var_os("CODEX_GUARD_CODEX_PATH").unwrap_or_else(|| "codex".into());
         let mut command = Command::new(&executable);
-        let arguments = app_server_arguments(mode);
+        let arguments = app_server_arguments();
         command
             .args(&arguments)
             .stdin(std::process::Stdio::piped())

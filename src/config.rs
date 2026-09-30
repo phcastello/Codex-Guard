@@ -6,46 +6,22 @@ use std::{collections::BTreeMap, fs, path::PathBuf, time::Duration};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
-    pub codex: Codex,
     pub runtime: Runtime,
     pub quota: Quota,
     pub credits: Credits,
     pub monitor: Monitor,
     pub burn_rate: BurnRate,
-    pub session: Session,
 }
 impl Default for Profile {
     fn default() -> Self {
         Self {
-            codex: Codex::default(),
             runtime: Runtime::default(),
             quota: Quota::default(),
             credits: Credits::default(),
             monitor: Monitor::default(),
             burn_rate: BurnRate::default(),
-            session: Session::default(),
         }
     }
-}
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum CodexMode {
-    #[default]
-    Inherit,
-    Yolo,
-}
-impl CodexMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Inherit => "INHERIT",
-            Self::Yolo => "YOLO",
-        }
-    }
-}
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Codex {
-    pub mode: CodexMode,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -121,13 +97,6 @@ impl Default for Monitor {
         }
     }
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Session {
-    // None means the App Server inherits the user's ordinary Codex config.
-    pub approval_policy: Option<String>,
-    pub sandbox: Option<String>,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BurnRate {
@@ -160,8 +129,6 @@ struct FileConfig {
     credits: Option<toml::Value>,
     monitor: Option<toml::Value>,
     burn_rate: Option<toml::Value>,
-    session: Option<toml::Value>,
-    codex: Option<toml::Value>,
     #[serde(default)]
     profiles: BTreeMap<String, toml::Value>,
 }
@@ -186,7 +153,6 @@ pub fn load(
     time: Option<&str>,
     attended: bool,
     no_bell: bool,
-    yolo: bool,
 ) -> Result<Loaded> {
     let path = path()?;
     let file: FileConfig = if path.exists() {
@@ -196,7 +162,7 @@ pub fn load(
     } else {
         FileConfig::default()
     };
-    resolve(file, path, name, credits, time, attended, no_bell, yolo)
+    resolve(file, path, name, credits, time, attended, no_bell)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -208,7 +174,6 @@ fn resolve(
     time: Option<&str>,
     attended: bool,
     no_bell: bool,
-    yolo: bool,
 ) -> Result<Loaded> {
     let profile_name = name
         .or(file.default_profile.as_deref())
@@ -224,8 +189,6 @@ fn resolve(
         ("credits", file.credits),
         ("monitor", file.monitor),
         ("burn_rate", file.burn_rate),
-        ("session", file.session),
-        ("codex", file.codex),
     ] {
         if let Some(part) = part {
             merge(value.get_mut(key).context("missing default section")?, part);
@@ -243,9 +206,6 @@ fn resolve(
     }
     if no_bell {
         profile.monitor.bell = false;
-    }
-    if yolo {
-        profile.codex.mode = CodexMode::Yolo;
     }
     validate(&profile)?;
     let mode = if attended {
@@ -323,14 +283,6 @@ fn validate(p: &Profile) -> Result<()> {
     if p.monitor.max_consecutive_failures > 5 {
         bail!("max_consecutive_failures must be 0..=5");
     }
-    if p.session
-        .approval_policy
-        .as_deref()
-        .is_some_and(str::is_empty)
-        || p.session.sandbox.as_deref().is_some_and(str::is_empty)
-    {
-        bail!("session approval_policy/sandbox must not be empty");
-    }
     Ok(())
 }
 pub fn duration(s: &str) -> Duration {
@@ -341,55 +293,40 @@ pub fn duration(s: &str) -> Duration {
 mod tests {
     use super::*;
     #[test]
-    fn codex_mode_merges_defaults_global_profile_and_cli() {
-        let default = resolve(
+    fn obsolete_permissions_are_ignored_and_financial_profiles_still_merge() {
+        for mode in ["inherit", "yolo"] {
+            let text = format!("[codex]\nmode = '{mode}'\n[session]\napproval_policy = 'on-request'\nsandbox = 'read-only'\n[credits]\nmax_spend = 12.0\n[profiles.conservative.codex]\nmode = 'inherit'\n[profiles.conservative.credits]\nmax_spend = 5.0");
+            let file: FileConfig = toml::from_str(&text).unwrap();
+            let loaded = resolve(
+                file,
+                PathBuf::new(),
+                Some("conservative"),
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(loaded.profile.credits.max_spend, 5.0);
+            assert_eq!(
+                loaded.profile.credits.reserve,
+                Profile::default().credits.reserve
+            );
+            let serialized = toml::to_string(&loaded.profile).unwrap();
+            assert!(!serialized.contains("codex"));
+            assert!(!serialized.contains("approval_policy"));
+            assert!(!serialized.contains("sandbox"));
+        }
+        let loaded = resolve(
             FileConfig::default(),
             PathBuf::new(),
             None,
+            Some(3.0),
             None,
-            None,
-            false,
             false,
             false,
         )
         .unwrap();
-        assert_eq!(default.profile.codex.mode, CodexMode::Inherit);
-        let file: FileConfig = toml::from_str(
-            "[codex]\nmode = 'yolo'\n[profiles.conservative.codex]\nmode = 'inherit'",
-        )
-        .unwrap();
-        let global = resolve(file, PathBuf::new(), None, None, None, false, false, false).unwrap();
-        assert_eq!(global.profile.codex.mode, CodexMode::Yolo);
-        let file: FileConfig = toml::from_str(
-            "[codex]\nmode = 'yolo'\n[profiles.conservative.codex]\nmode = 'inherit'",
-        )
-        .unwrap();
-        let profile = resolve(
-            file,
-            PathBuf::new(),
-            Some("conservative"),
-            None,
-            None,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
-        assert_eq!(profile.profile.codex.mode, CodexMode::Inherit);
-        let file: FileConfig =
-            toml::from_str("[profiles.conservative.codex]\nmode = 'inherit'").unwrap();
-        let cli = resolve(
-            file,
-            PathBuf::new(),
-            Some("conservative"),
-            Some(5.0),
-            None,
-            false,
-            false,
-            true,
-        )
-        .unwrap();
-        assert_eq!(cli.profile.codex.mode, CodexMode::Yolo);
-        assert_eq!(cli.profile.credits.max_spend, 5.0);
+        assert_eq!(loaded.profile.credits.max_spend, 3.0);
     }
 }

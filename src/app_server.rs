@@ -1,4 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
+mod models;
+pub use models::{Model, ModelSelection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -173,6 +175,16 @@ impl Client {
             .call_with_timeout("account/rateLimits/read", None, Duration::from_secs(5))
             .await?;
         RateSnapshot::parse(&result)
+    }
+    pub async fn list_models(&self) -> Result<Vec<Model>> {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            models::collect_models(|params| {
+                self.call_with_timeout("model/list", Some(params), Duration::from_secs(5))
+            }),
+        )
+        .await
+        .context("model/list catalog timed out")?
     }
     pub async fn thread_usage(&self, thread_id: &str) -> Result<Option<ThreadUsage>> {
         let result = self

@@ -40,9 +40,6 @@ pub struct RunArgs {
     pub attended: bool,
     #[arg(long)]
     pub no_bell: bool,
-    /// Run the owned Codex without sandbox or approvals (financial limits still apply).
-    #[arg(long)]
-    pub yolo: bool,
     #[arg(num_args = 0.., trailing_var_arg = true, value_name = "PROMPT")]
     pub prompt: Vec<String>,
 }
